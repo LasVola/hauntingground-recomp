@@ -1,0 +1,30 @@
+# Game data never goes into this repository
+game/*
+!game/README.md
+*.iso
+*.bin
+*.img
+*.chd
+*.cso
+*.7z
+*.elf
+SLUS_*
+DATA.CVM
+*.cvm
+*.CVM
+*.sfd
+*.adx
+*.irx
+*.IRX
+*.ps2
+*.state
+*.wav
+*.raw
+# Everything recompiled from the game (translated game code) and build output
+generated/
+build/
+out/
+deps/
+logs/
+__pycache__/
+*.pyc

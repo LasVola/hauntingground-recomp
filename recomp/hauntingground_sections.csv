@@ -1,0 +1,18 @@
+Name,Start,End,Kind
+# The recompiler's section map of SLUS_210.75 (sha256 3B374D53...DACB8). The disc ELF has ONE RWX section,
+# 0x00100000-0x0047B200, holding code, VU microcode, data, rodata, MW static initializers and their data, and no BSS
+# header. build.py generate writes build/SLUS_210.75.recomp.elf with these section headers for ps2_recomp only (program
+# headers and every loaded byte unchanged); the runtime loads the disc's own ELF. Rows must tile the PT_LOAD segment
+# 0x00100000-0x01992000 in order. Kinds: code = EE code (SHF_EXECINSTR); vu = VU microcode (.vutext*, executable
+# but skipped by ps2_recomp's isExecutableSection); data/rodata = not code; ctors = the MW constructor table
+# (ps2_recomp makes each entry a correctness-critical start); bss = NOBITS.
+# Block evidence: recon/boundaries/BOUNDARIES.md section 2 and port_prep/boundaries/out/check_layout.txt.
+.text,0x00100000,0x003A1B80,code             # crt0 + game (MW) + SDK 3.0.2 + CRI; ends with the this-adjusting thunks
+.vutext,0x003A1B80,0x003AC780,vu             # 45 VIF DMA tags walk exactly to 0x3AC780; 33 MPG words
+.data,0x003AC780,0x0044A9A0,data             # vtables, PTMF records, script bytecode, strings, libkernl kernel blobs
+.rodata.cdvdman_irx,0x0044A9A0,0x0044AD00,rodata  # an embedded IOP IRX image (ELF e_type 0xFF80)
+.rodata,0x0044AD00,0x00464480,rodata         # all 228 switch tables
+.sinit,0x00464480,0x00469460,code            # 143 MW static constructors
+.ctors,0x00469460,0x004696A0,ctors           # Sinit_Table: 143 entries + the 0 terminator at 0x46969C
+.data.sinit,0x004696A0,0x0047B200,data       # vtables (15,060 code pointers)
+.bss,0x0047B200,0x01992000,bss               # PT_LOAD memsz beyond filesz; gp 0x004828F0 (.reginfo)
