@@ -1,6 +1,7 @@
 # Haunting Ground game layer (hauntingground.exe) and the recompiled game code. Cloned from the God Hand port's
 # src/CMakeLists.txt (adapted from the Urban Reign port's); God Hand's cheats, button prompts and SNR2 module packs
-# were removed on 2026-10-18 (Haunting Ground loads no code at run time).
+# were removed on 2026-10-18 (Haunting Ground loads no code at run time). Haunting Ground's own button prompts
+# (hg/button_prompts, hg/prompt_art, hg/prompt_cells) were added the same day.
 
 # HG_ARCH: instruction set the compiler may use in the generated code (game code + VU1 AOT, the bulk of the build).
 # SSE41 (default): one exe for every CPU with SSE4.1 (MSVC has no /arch:SSE4.2, so its own code stays SSE2 and the
@@ -33,6 +34,7 @@ file(GLOB HG_GENERATED_SOURCES CONFIGURE_DEPENDS "${HG_GENERATED_DIR}/*.cpp")
 
 set(HG_HOST_SOURCES
     main.cpp
+    hg/button_prompts.cpp
     hg/call_profile.cpp
     hg/call_trace.cpp
     hg/function_hooks.cpp
@@ -41,6 +43,8 @@ set(HG_HOST_SOURCES
     hg/hle_bindings.cpp
     hg/host_window.cpp
     hg/log.cpp
+    hg/prompt_art.cpp
+    hg/prompt_cells.cpp
     hg/sha256.cpp
     hg/thread_policy.cpp
 )
@@ -166,6 +170,8 @@ else()
 endif()
 
 add_executable(hauntingground ${HG_HOST_SOURCES})
+# hg/button_prompts.cpp reads ps2_host_input::prompts (runtime/ps2xRuntime/src/lib/ps2_host_input.h, not a public header).
+set_source_files_properties(hg/button_prompts.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/runtime/ps2xRuntime/src/lib")
 target_include_directories(hauntingground PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}/hg_generated"
@@ -198,8 +204,11 @@ endif()
 
 # VU1 microcode compiled ahead of time: capture the code images with PS2X_VU1_CAPTURE, then run vu1_recomp (configure
 # with -DHG_BUILD_TOOLS=ON) into generated/vu1. Images not compiled stay interpreted. GENERIC (Urban, SotC).
-# An empty or missing generated/vu1 (Haunting Ground today: no images captured yet) gives no hg_vu1_code library and no
-# HG_HAS_VU1_PROGRAMS define, so main.cpp neither declares nor calls registerGeneratedVu1Programs().
+# An empty or missing generated/vu1 gives no hg_vu1_code library and no HG_HAS_VU1_PROGRAMS define, so main.cpp neither
+# declares nor calls registerGeneratedVu1Programs().
+# Content-keyed units (vu1_recomp --content, Haunting Ground 2026-10-18) live in the same folder as vu1_content_*.cpp; their
+# registry vu1_content_programs.cpp gives HG_HAS_VU1_CONTENT_PROGRAMS (main.cpp registers them and turns
+# PS2X_VU1_CONTENT_AOT on by default).
 file(GLOB HG_VU1_SOURCES CONFIGURE_DEPENDS "${HG_GENERATED_DIR}/vu1/*.cpp")
 if(HG_VU1_SOURCES)
     add_library(hg_vu1_code STATIC ${HG_VU1_SOURCES})
@@ -207,6 +216,9 @@ if(HG_VU1_SOURCES)
     target_link_libraries(hg_vu1_code PUBLIC ps2_runtime)
     target_link_libraries(hauntingground PRIVATE hg_vu1_code)
     target_compile_definitions(hauntingground PRIVATE HG_HAS_VU1_PROGRAMS=1)
+    if(EXISTS "${HG_GENERATED_DIR}/vu1/vu1_content_programs.cpp")
+        target_compile_definitions(hauntingground PRIVATE HG_HAS_VU1_CONTENT_PROGRAMS=1)
+    endif()
     if(MSVC)
         target_compile_options(hg_vu1_code PRIVATE /bigobj /fp:precise ${HG_ARCH_FLAG} /W0 /MP /d2OptimizeHugeFunctions $<$<CONFIG:RelWithDebInfo>:/Ob2>)
     endif()

@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_threaded_backend.h"
+#include "runtime/gs/gs_recording.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_gpu_backend.h"
 #include "runtime/gs/gs_pcsx2_backend.h"
@@ -9,6 +10,10 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <memory>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -353,6 +358,10 @@ void GSThreadedBackend::WorkerLoop()
             std::lock_guard<std::mutex> exec(m_execMutex);
             Execute(chunk, draw);
         }
+        // Bug recorder: a copy of the executed chunk goes into the ring (GS thread only; the chunk itself is recycled as
+        // before).
+        if (m_ringEnabled.load(std::memory_order_acquire))
+            RingCapture(chunk);
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             ++m_completed;
@@ -439,6 +448,11 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
         case Op::GsReset:
             m_inner->GsReset();
             break;
+        case Op::RingMark:
+            RingAtMark(payload, static_cast<uint32_t>(offset - 5u - length), draw);
+            break;
+        case Op::RingRecord:
+            break;
         }
     }
 }
@@ -449,6 +463,620 @@ void GSThreadedBackend::RunOnWorker(const std::function<void()> &function) const
     const std::function<void()> *pointer = &function;
     self->Enqueue(Op::Call, &pointer, sizeof(pointer));
     Drain();
+}
+
+// ---- Bug recorder GS ring (gs_recording.h GSRing) ---------------------------------------------------------------------
+// The GS thread keeps the chunks it has executed (this queue's own format) instead of recycling them at once. Field
+// marks (Op::RingMark, from GSRingRecorderBackend on the game thread) split them into fields; every 15 fields a mark
+// starts a segment with a State checkpoint taken right there in stream order (GPU: asynchronous copy). Dropped chunks go
+// back to the spare pool, so the steady state allocates nothing.
+
+namespace GSRing
+{
+    struct Checkpoint
+    {
+        uint64_t tick = 0u;
+        std::array<uint64_t, 7> display{};
+        std::chrono::steady_clock::time_point requested{};
+        std::mutex mutex;
+        std::condition_variable cv;
+        int status = 0; // 0 pending, 1 ready, -1 failed
+        std::vector<uint8_t> vram;
+        GSBackendState state;
+
+        void Finish(std::vector<uint8_t> &&bytes, GSBackendState &&backendState, bool ok);
+        bool Wait(int waitMs);
+    };
+
+    struct Collected
+    {
+        struct Start
+        {
+            uint64_t seq = 0u;
+            uint32_t offset = 0u; // of the start mark in that chunk
+            std::shared_ptr<Checkpoint> checkpoint;
+            GSDrawState drawState{};
+            uint32_t mxcsr = 0u;
+        };
+        std::vector<Start> starts;
+        struct Span
+        {
+            uint64_t seq = 0u;
+            std::shared_ptr<const void> block; // keeps the ring block alive
+            size_t offset = 0u;
+            size_t size = 0u;
+            const uint8_t *data = nullptr;
+        };
+        std::vector<Span> chunks;
+        bool hasEnd = false;
+        uint64_t endSeq = 0u;
+        uint32_t endOffset = 0u;
+        std::shared_ptr<Checkpoint> end;
+    };
+}
+
+namespace
+{
+    constexpr uint32_t kRingSegmentFields = 15u; // a State checkpoint every 15 fields (~0.25 s)
+    constexpr size_t kRingKeepFields = 60u;      // the oldest segment goes once the newer ones hold >= 60 fields
+    constexpr size_t kRingCheckpointBytes = 4u << 20u;
+
+    struct RingMarkPayload
+    {
+        uint64_t tick;
+        std::array<uint64_t, 7> display;
+        uint32_t restart;
+        uint32_t reserved;
+    };
+
+    constexpr size_t kRingBlockBytes = 4u << 20u; // chunks are copied into 4 MB blocks
+    constexpr size_t kRingFreeBlocks = 4u;
+
+    struct RingBlock
+    {
+        std::vector<uint8_t> bytes; // fixed size, never reallocated (readers keep spans of it)
+        size_t used = 0u;
+        uint64_t lastSeq = 0u;
+    };
+
+    struct RingChunk
+    {
+        uint64_t seq;
+        std::shared_ptr<RingBlock> block;
+        size_t offset;
+        size_t size;
+    };
+
+    struct RingSegment
+    {
+        uint64_t seq;
+        uint32_t offset;
+        std::shared_ptr<GSRing::Checkpoint> checkpoint;
+        GSDrawState drawState;
+        uint32_t mxcsr;
+        size_t fields;
+    };
+
+    struct RingEvent
+    {
+        uint32_t offset = 0u;
+        bool start = false;
+        bool restart = false;
+        uint64_t ticket = 0u;
+        std::shared_ptr<GSRing::Checkpoint> checkpoint;
+        GSDrawState drawState{};
+        uint32_t mxcsr = 0u;
+    };
+
+    struct RingStore
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<RingChunk> chunks;
+        std::deque<RingSegment> segments;
+        size_t bytes = 0u;
+        size_t budget = size_t(256) << 20u;
+        bool active = false;
+        std::atomic<uint64_t> requested{0u};
+        uint64_t served = 0u;
+        std::shared_ptr<GSRing::Collected> handed;
+        uint64_t checkpoints = 0u;
+        uint64_t failed = 0u;
+        uint64_t dropped = 0u;
+        uint64_t restarts = 0u;
+        uint64_t delayCount = 0u;
+        double delayMsSum = 0.0;
+        double delayMsMax = 0.0;
+        // GS thread only.
+        uint64_t nextSeq = 0u;
+        uint32_t fieldsInSegment = 0u;
+        bool needSegment = true;
+        uint64_t claimedTicket = 0u;
+        std::vector<RingEvent> events;
+        std::deque<std::shared_ptr<RingBlock>> blocks; // in use, oldest first
+        std::vector<std::shared_ptr<RingBlock>> freeBlocks;
+    };
+
+    RingStore &ringStore()
+    {
+        static RingStore *store = new RingStore(); // never destroyed: a checkpoint may finish on the GS thread at exit
+        return *store;
+    }
+
+    // Removes chunks older than seq, then the blocks only they used (back to the free list unless a writer still holds
+    // them). Store locked; GS thread.
+    void dropChunksBefore(RingStore &s, uint64_t seq)
+    {
+        while (!s.chunks.empty() && s.chunks.front().seq < seq)
+            s.chunks.pop_front();
+        while (s.blocks.size() > 1u && s.blocks.front()->lastSeq < seq)
+        {
+            std::shared_ptr<RingBlock> block = std::move(s.blocks.front());
+            s.blocks.pop_front();
+            s.bytes -= block->bytes.size();
+            if (block.use_count() == 1 && block->bytes.size() == kRingBlockBytes && s.freeBlocks.size() < kRingFreeBlocks)
+            {
+                block->used = 0u;
+                block->lastSeq = 0u;
+                s.freeBlocks.push_back(std::move(block));
+            }
+        }
+    }
+}
+
+namespace GSRing
+{
+    void Checkpoint::Finish(std::vector<uint8_t> &&bytes, GSBackendState &&backendState, bool ok)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            vram = std::move(bytes);
+            state = std::move(backendState);
+            status = ok ? 1 : -1;
+        }
+        cv.notify_all();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requested).count();
+        RingStore &store = ringStore();
+        std::lock_guard<std::mutex> lock(store.mutex);
+        if (!ok)
+            ++store.failed;
+        ++store.delayCount;
+        store.delayMsSum += ms;
+        store.delayMsMax = std::max(store.delayMsMax, ms);
+    }
+
+    bool Checkpoint::Wait(int waitMs)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait_for(lock, std::chrono::milliseconds(waitMs), [&] { return status != 0; });
+        return status == 1;
+    }
+
+    bool Active() { return GSThreadedBackend::RingActive(); }
+    std::shared_ptr<Collected> Collect(int waitMs, size_t keepSegments)
+    {
+        return GSThreadedBackend::RingCollect(waitMs, keepSegments);
+    }
+    bool Write(const Collected &collected, const std::string &path, std::string &summary)
+    {
+        return GSThreadedBackend::RingWrite(collected, path, summary);
+    }
+    std::string Stats() { return GSThreadedBackend::RingStats(); }
+}
+
+void GSThreadedBackend::EnableRing()
+{
+    RingStore &s = ringStore();
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        s.active = true;
+        if (const char *mb = std::getenv("PS2X_BUG_RECORDER_GS_MB"); mb && *mb)
+            s.budget = static_cast<size_t>(std::clamp(std::atoi(mb), 16, 4096)) << 20u;
+    }
+    m_ringEnabled.store(true, std::memory_order_release);
+}
+
+void GSThreadedBackend::RingMark(uint64_t tick, const std::array<uint64_t, 7> &display, bool restart)
+{
+    const RingMarkPayload mark{tick, display, restart ? 1u : 0u, 0u};
+    Enqueue(Op::RingMark, &mark, sizeof(mark));
+}
+
+void GSThreadedBackend::RingRecord(uint8_t op, const void *payload, uint32_t size)
+{
+    std::vector<uint8_t> record(1u + size);
+    record[0] = op;
+    if (size != 0u)
+        std::memcpy(record.data() + 1u, payload, size);
+    Enqueue(Op::RingRecord, record.data(), static_cast<uint32_t>(record.size()));
+}
+
+// GS thread, inside Execute: a field mark at opOffset of the chunk being executed (stream order).
+void GSThreadedBackend::RingAtMark(const uint8_t *payload, uint32_t opOffset, const GSPrimitiveBatch &draw)
+{
+    if (!m_ringEnabled.load(std::memory_order_relaxed))
+        return;
+    RingStore &s = ringStore();
+    RingMarkPayload mark{};
+    std::memcpy(&mark, payload, sizeof(mark));
+    RingEvent event;
+    event.offset = opOffset;
+    if (mark.restart)
+    {
+        event.restart = true;
+        s.needSegment = true;
+        s.events.clear(); // marks earlier in this chunk belong to the stream before the restart
+    }
+    const uint64_t requested = s.requested.load(std::memory_order_acquire);
+    uint64_t served = 0u;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        served = s.served;
+    }
+    const bool dump = requested > served && requested != s.claimedTicket;
+    if (s.needSegment || s.fieldsInSegment >= kRingSegmentFields || dump)
+    {
+        auto checkpoint = std::make_shared<GSRing::Checkpoint>();
+        checkpoint->tick = mark.tick;
+        checkpoint->display = mark.display;
+        checkpoint->requested = std::chrono::steady_clock::now();
+        if (auto *gpu = dynamic_cast<GSGpuBackend *>(m_inner.get()))
+        {
+            const bool started = gpu->BeginSnapshotAsync([checkpoint](std::vector<uint8_t> &&vram, GSBackendState &&state)
+                                                         {
+                                                             const bool ok = !vram.empty();
+                                                             checkpoint->Finish(std::move(vram), std::move(state), ok);
+                                                         });
+            if (!started)
+                checkpoint->Finish({}, GSBackendState{}, false);
+        }
+        else
+        {
+            // CPU back end: its VRAM is host memory, copied here (on the GS thread).
+            m_inner->Flush();
+            std::vector<uint8_t> vram;
+            m_inner->SnapshotVram(vram);
+            GSBackendState state;
+            bool ok = !vram.empty();
+            if (auto *access = dynamic_cast<GSBackendStateAccess *>(m_inner.get()))
+                ok = access->ExportState(state) && ok;
+            checkpoint->Finish(std::move(vram), std::move(state), ok);
+        }
+        event.start = true;
+        event.checkpoint = std::move(checkpoint);
+        event.drawState = draw.state;
+        event.mxcsr = _mm_getcsr();
+        if (dump)
+        {
+            event.ticket = requested;
+            s.claimedTicket = requested;
+        }
+        s.fieldsInSegment = 0u;
+        s.needSegment = false;
+    }
+    ++s.fieldsInSegment;
+    s.events.push_back(std::move(event));
+}
+
+// GS thread, after Execute: a copy of the chunk joins the ring; segments/handover/trim.
+void GSThreadedBackend::RingCapture(const std::vector<uint8_t> &chunk)
+{
+    RingStore &s = ringStore();
+    const uint64_t seq = s.nextSeq++;
+    const size_t size = chunk.size();
+    // The copy is made outside the lock: blocks are only appended here, and readers only read the spans they were given.
+    std::shared_ptr<RingBlock> block = s.blocks.empty() ? nullptr : s.blocks.back();
+    bool newBlock = false;
+    if (!block || block->used + size > block->bytes.size())
+    {
+        if (size <= kRingBlockBytes && !s.freeBlocks.empty())
+        {
+            block = std::move(s.freeBlocks.back());
+            s.freeBlocks.pop_back();
+        }
+        else
+        {
+            block = std::make_shared<RingBlock>();
+            block->bytes.resize(std::max(size, kRingBlockBytes));
+        }
+        newBlock = true;
+    }
+    const size_t offset = block->used;
+    if (size != 0u)
+        std::memcpy(block->bytes.data() + offset, chunk.data(), size);
+    block->used += size;
+    block->lastSeq = seq;
+    bool handed = false;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (newBlock)
+        {
+            s.blocks.push_back(block);
+            s.bytes += block->bytes.size();
+        }
+        s.chunks.push_back({seq, block, offset, size});
+        for (RingEvent &event : s.events)
+        {
+            if (event.restart)
+            {
+                for (const RingSegment &segment : s.segments)
+                {
+                    (void)segment;
+                    s.bytes -= kRingCheckpointBytes;
+                }
+                s.segments.clear();
+                dropChunksBefore(s, seq);
+                ++s.restarts;
+            }
+            if (event.start)
+            {
+                if (event.ticket != 0u && event.ticket > s.served)
+                {
+                    auto collected = std::make_shared<GSRing::Collected>();
+                    for (const RingSegment &segment : s.segments)
+                        collected->starts.push_back({segment.seq, segment.offset, segment.checkpoint, segment.drawState, segment.mxcsr});
+                    if (!s.segments.empty())
+                        for (const RingChunk &ringChunk : s.chunks)
+                            if (ringChunk.seq >= s.segments.front().seq)
+                                collected->chunks.push_back({ringChunk.seq, ringChunk.block, ringChunk.offset, ringChunk.size,
+                                                             ringChunk.block->bytes.data() + ringChunk.offset});
+                    collected->hasEnd = true;
+                    collected->endSeq = seq;
+                    collected->endOffset = event.offset;
+                    collected->end = event.checkpoint;
+                    s.handed = std::move(collected);
+                    s.served = event.ticket;
+                    handed = true;
+                }
+                s.segments.push_back({seq, event.offset, event.checkpoint, event.drawState, event.mxcsr, 1u});
+                s.bytes += kRingCheckpointBytes;
+                ++s.checkpoints;
+            }
+            else if (!s.segments.empty())
+                ++s.segments.back().fields;
+        }
+        s.events.clear();
+        if (s.segments.empty())
+            dropChunksBefore(s, seq + 1u); // nothing replayable before the first checkpoint
+        while (s.segments.size() > 1u)
+        {
+            size_t newer = 0u;
+            for (size_t i = 1u; i < s.segments.size(); ++i)
+                newer += s.segments[i].fields;
+            if (newer < kRingKeepFields && s.bytes <= s.budget)
+                break;
+            s.bytes -= kRingCheckpointBytes;
+            s.segments.pop_front();
+            ++s.dropped;
+            dropChunksBefore(s, s.segments.front().seq);
+        }
+    }
+    if (handed)
+        s.cv.notify_all();
+}
+
+bool GSThreadedBackend::RingActive()
+{
+    RingStore &s = ringStore();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.active;
+}
+
+std::shared_ptr<GSRing::Collected> GSThreadedBackend::RingCollect(int waitMs, size_t keepSegments)
+{
+    RingStore &s = ringStore();
+    std::unique_lock<std::mutex> lock(s.mutex);
+    if (!s.active)
+        return nullptr;
+    const uint64_t ticket = s.requested.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    std::shared_ptr<GSRing::Collected> result;
+    if (s.cv.wait_for(lock, std::chrono::milliseconds(waitMs), [&] { return s.served >= ticket; }) && s.handed)
+        result = s.handed;
+    else
+    {
+        // No field mark came (no GS activity): the ring as it is, without an End checkpoint.
+        result = std::make_shared<GSRing::Collected>();
+        for (const RingSegment &segment : s.segments)
+            result->starts.push_back({segment.seq, segment.offset, segment.checkpoint, segment.drawState, segment.mxcsr});
+        if (!s.segments.empty())
+            for (const RingChunk &chunk : s.chunks)
+                if (chunk.seq >= s.segments.front().seq)
+                    result->chunks.push_back({chunk.seq, chunk.block, chunk.offset, chunk.size, chunk.block->bytes.data() + chunk.offset});
+        s.served = std::max(s.served, s.requested.load(std::memory_order_acquire)); // withdraw the request
+    }
+    s.handed.reset();
+    lock.unlock();
+    // A shorter stream (automatic bundles): only the newest keepSegments segments; RingWrite starts at the first one
+    // left and skips the chunks before it.
+    if (keepSegments != 0u && result->starts.size() > keepSegments)
+        result->starts.erase(result->starts.begin(),
+                             result->starts.end() - static_cast<std::ptrdiff_t>(keepSegments));
+    while (!result->starts.empty() && !result->starts.front().checkpoint->Wait(waitMs))
+        result->starts.erase(result->starts.begin()); // its checkpoint failed: the stream starts at the next one
+    if (result->end && !result->end->Wait(waitMs))
+        result->end.reset(); // the stream still ends there; End then has no VRAM
+    return result;
+}
+
+bool GSThreadedBackend::RingWrite(const GSRing::Collected &collected, const std::string &path, std::string &summary)
+{
+    if (collected.starts.empty() || collected.chunks.empty())
+    {
+        summary = "no GS commands in the ring";
+        return false;
+    }
+    const GSRing::Collected::Start &start = collected.starts.front();
+    size_t first = 0u;
+    while (first < collected.chunks.size() && collected.chunks[first].seq != start.seq)
+        ++first;
+    if (first == collected.chunks.size())
+    {
+        summary = "ring start chunk missing";
+        return false;
+    }
+    std::FILE *file = std::fopen(path.c_str(), "wb");
+    if (!file)
+    {
+        summary = "cannot write " + path;
+        return false;
+    }
+    std::setvbuf(file, nullptr, _IOFBF, 4u << 20u);
+    static constexpr char kGsrMagic[8] = {'P', 'S', '2', 'X', 'G', 'S', 'R', '1'};
+    std::fwrite(kGsrMagic, 1, sizeof(kGsrMagic), file);
+    uint64_t written = sizeof(kGsrMagic);
+    const auto record = [&](GSRecording::Op op, const void *payload, uint32_t size)
+    {
+        const uint8_t opByte = static_cast<uint8_t>(op);
+        std::fwrite(&opByte, 1, 1, file);
+        std::fwrite(&size, sizeof(size), 1, file);
+        if (size != 0u)
+            std::fwrite(payload, 1, size, file);
+        written += 5u + size;
+    };
+    std::vector<uint8_t> scratch;
+    const auto put = [&](const auto &value)
+    {
+        const auto *p = reinterpret_cast<const uint8_t *>(&value);
+        scratch.insert(scratch.end(), p, p + sizeof(value));
+    };
+    const auto checkpointRecord = [&](GSRecording::Op op, uint64_t tick, const std::array<uint64_t, 7> &display,
+                                      const GSRing::Checkpoint *full)
+    {
+        scratch.clear();
+        put(tick);
+        put(display);
+        if (full)
+        {
+            put(static_cast<uint32_t>(full->vram.size()));
+            scratch.insert(scratch.end(), full->vram.begin(), full->vram.end());
+            GSRecording::AppendState(scratch, full->state);
+        }
+        else
+        {
+            put(uint32_t{0u});
+            GSRecording::AppendState(scratch, GSBackendState{});
+        }
+        record(op, scratch.data(), static_cast<uint32_t>(scratch.size()));
+    };
+
+    checkpointRecord(GSRecording::Op::State, start.checkpoint->tick, start.checkpoint->display, start.checkpoint.get());
+    record(GSRecording::Op::Mxcsr, &start.mxcsr, sizeof(start.mxcsr));
+    GSPrimitiveBatch batch{};
+    batch.state = start.drawState;
+    constexpr uint32_t kVertexBytes = static_cast<uint32_t>(offsetof(GSPrimitiveBatch, state));
+    bool firstMark = true;
+    uint64_t lastTick = start.checkpoint->tick;
+    std::array<uint64_t, 7> lastDisplay = start.checkpoint->display;
+    size_t fields = 0u;
+    size_t draws = 0u;
+    for (size_t index = first; index < collected.chunks.size(); ++index)
+    {
+        const uint64_t seq = collected.chunks[index].seq;
+        const uint8_t *data = collected.chunks[index].data;
+        const size_t chunkSize = collected.chunks[index].size;
+        size_t offset = index == first ? start.offset : 0u;
+        const bool last = collected.hasEnd && seq == collected.endSeq;
+        const size_t end = last ? std::min<size_t>(collected.endOffset, chunkSize) : chunkSize;
+        while (offset + 5u <= end)
+        {
+            const Op op = static_cast<Op>(data[offset]);
+            uint32_t length = 0u;
+            std::memcpy(&length, data + offset + 1u, sizeof(length));
+            const uint8_t *payload = data + offset + 5u;
+            offset += 5u + length;
+            switch (op)
+            {
+            case Op::Mxcsr:
+                record(GSRecording::Op::Mxcsr, payload, length);
+                break;
+            case Op::Submit:
+                record(GSRecording::Op::Submit, payload, length);
+                ++draws;
+                break;
+            case Op::LoadClut:
+                record(GSRecording::Op::LoadClut, payload, length);
+                break;
+            case Op::BeginTransfer:
+                record(GSRecording::Op::BeginTransfer, payload, length);
+                break;
+            case Op::Upload:
+                record(GSRecording::Op::Upload, payload, length);
+                break;
+            case Op::TextureFlush:
+                record(GSRecording::Op::TextureFlush, nullptr, 0u);
+                break;
+            case Op::WriteVram:
+                record(GSRecording::Op::WriteVram, payload, length);
+                break;
+            case Op::DrawState:
+                std::memcpy(static_cast<void *>(&batch.state), payload, std::min<size_t>(length, sizeof(batch.state)));
+                break;
+            case Op::Vertices:
+                std::memcpy(static_cast<void *>(&batch), payload, std::min<size_t>(length, kVertexBytes));
+                record(GSRecording::Op::Submit, &batch, sizeof(batch));
+                ++draws;
+                break;
+            case Op::RingMark:
+            {
+                RingMarkPayload mark{};
+                std::memcpy(&mark, payload, std::min<size_t>(length, sizeof(mark)));
+                if (firstMark)
+                    firstMark = false; // the State record stands for it
+                else
+                    checkpointRecord(GSRecording::Op::Field, mark.tick, mark.display, nullptr);
+                lastTick = mark.tick;
+                lastDisplay = mark.display;
+                ++fields;
+                break;
+            }
+            case Op::RingRecord:
+                if (length >= 1u)
+                    record(static_cast<GSRecording::Op>(payload[0]), payload + 1u, length - 1u);
+                break;
+            default: // Sync, Present, Call (synchronous calls, async readbacks), raw GIF: nothing for the replay
+                break;
+            }
+        }
+        if (last)
+            break;
+    }
+    const bool fullEnd = collected.end && collected.end->status == 1;
+    if (fullEnd)
+        checkpointRecord(GSRecording::Op::End, collected.end->tick, collected.end->display, collected.end.get());
+    else
+        checkpointRecord(GSRecording::Op::End, lastTick + 1u, lastDisplay, nullptr);
+    const bool ok = std::ferror(file) == 0;
+    std::fclose(file);
+    const std::string endText = fullEnd ? "at " + std::to_string(collected.end->tick) + " with VRAM" : std::string("without VRAM");
+    char text[256];
+    std::snprintf(text, sizeof(text), "%zu fields (ticks %llu-%llu), %zu draws, State at %llu, End %s, %.1f MB", fields,
+                  static_cast<unsigned long long>(start.checkpoint->tick), static_cast<unsigned long long>(lastTick), draws,
+                  static_cast<unsigned long long>(start.checkpoint->tick), endText.c_str(),
+                  static_cast<double>(written) / (1024.0 * 1024.0));
+    summary = text;
+    return ok;
+}
+
+std::string GSThreadedBackend::RingStats()
+{
+    RingStore &s = ringStore();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.active)
+        return "GS ring off";
+    size_t fields = 0u;
+    for (const RingSegment &segment : s.segments)
+        fields += segment.fields;
+    const uint64_t firstTick = s.segments.empty() || !s.segments.front().checkpoint ? 0u : s.segments.front().checkpoint->tick;
+    char text[320];
+    std::snprintf(text, sizeof(text),
+                  "GS ring %zu fields from tick %llu in %zu segments, %.1f MB (%zu chunks); checkpoints %llu (failed %llu, "
+                  "delay avg %.1f max %.1f ms), segments dropped %llu, restarts %llu",
+                  fields, static_cast<unsigned long long>(firstTick), s.segments.size(),
+                  static_cast<double>(s.bytes) / (1024.0 * 1024.0), s.chunks.size(), static_cast<unsigned long long>(s.checkpoints),
+                  static_cast<unsigned long long>(s.failed), s.delayCount ? s.delayMsSum / s.delayCount : 0.0, s.delayMsMax,
+                  static_cast<unsigned long long>(s.dropped), static_cast<unsigned long long>(s.restarts));
+    s.delayMsMax = 0.0;
+    return text;
 }
 
 void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)

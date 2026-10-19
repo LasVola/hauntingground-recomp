@@ -238,7 +238,8 @@ struct PS2AudioBackend::Impl
     std::FILE *dump = nullptr;
     uint32_t dumpBytes = 0u;
     // PS2X_AUDIO_OUT_DUMP=<file>: raw PCM (s16le stereo 48 kHz, no header) of exactly what the callback hands the sound
-    // card, after the queue, rate control and time-stretch (PS2X_AUDIO_DUMP is the SPU2 output before all of them).
+    // card, after the queue, rate control and time-stretch. PS2X_AUDIO_BACKEND_DUMP is this backend's pre-queue WAV;
+    // PS2X_AUDIO_DUMP remains the separate raw SPU2 output owned by iop_spu2.cpp.
     // Written also while muted, so hidden runs can measure host-side repeats and skips. Flushed per callback.
     std::FILE *outDump = nullptr;
     bool statsEnabled = false;
@@ -400,7 +401,7 @@ void PS2AudioBackend::setAudioReady(bool ready)
             SetAudioStreamCallback(m_impl->stream, &Impl::audioCallback);
             PlayAudioStream(m_impl->stream);
         }
-        const char *path = std::getenv("PS2X_AUDIO_DUMP");
+        const char *path = std::getenv("PS2X_AUDIO_BACKEND_DUMP");
         if (path && *path)
         {
             m_impl->dump = std::fopen(path, "wb");

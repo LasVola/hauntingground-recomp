@@ -43,8 +43,8 @@ namespace ps2x::iop::detail
     private:
         bool open();
         void read(uint64_t address, uint8_t *destination, size_t size);
-        void write(uint64_t address, const uint8_t *source, size_t size);
-        void eraseBlock(uint64_t address);
+        bool write(uint64_t address, const uint8_t *source, size_t size);
+        bool eraseBlock(uint64_t address);
 
         std::filesystem::path m_path;
         bool m_create = false;

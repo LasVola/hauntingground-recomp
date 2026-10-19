@@ -895,6 +895,14 @@ void drawTriangle(uint p, uint s, int x, int y)
     if ((flags & F_TME) != 0u)
     {
         uint texel;
+#if HIRES
+        // p[36] != 0 (host, addTriangle): a point-sampled triangle whose texture moves 1:1 with the screen (dU/dx = dV/dy
+        // = 1, dU/dy = dV/dx = 0). It reads drawn pages as a 1:1 sprite does: the texel of the native pixel, in this
+        // sample's own plane, so each plane sees exactly what the GS does at 1x. Haunting Ground's shadow volumes count
+        // in their own target this way (alpha read back as PSMT8H through a +/-1 CLUT): the plane picked from the
+        // sample's sub-texel position read the neighbouring sample's count and left every volume edge in the mask.
+        bool unitMap = pw(p, 36u) != 0u;
+#endif
         if ((flags & F_FST) != 0u)
         {
             uint uv0 = pw(p, 29u);
@@ -902,6 +910,14 @@ void drawTriangle(uint p, uint s, int x, int y)
             uint uv2 = pw(p, 31u);
             precise float fu = float(uv0 & 0xFFFFu) * w0 + float(uv1 & 0xFFFFu) * w1 + float(uv2 & 0xFFFFu) * w2;
             precise float fv = float(uv0 >> 16u) * w0 + float(uv1 >> 16u) * w1 + float(uv2 >> 16u) * w2;
+#if HIRES
+            if (unitMap)
+            {
+                gCorner = true;
+                gCornerU = float(int(fu - float(gSubX))) / 16.0;
+                gCornerV = float(int(fv - float(gSubY))) / 16.0;
+            }
+#endif
             texel = sampleTexture(s, 0.0, 0.0, 1.0, uint(int(fu)) & 0xFFFFu, uint(int(fv)) & 0xFFFFu);
         }
         else
@@ -909,8 +925,21 @@ void drawTriangle(uint p, uint s, int x, int y)
             precise float is = pf(p, 20u) * w0 + pf(p, 23u) * w1 + pf(p, 26u) * w2;
             precise float it = pf(p, 21u) * w0 + pf(p, 24u) * w1 + pf(p, 27u) * w2;
             precise float iq = pf(p, 22u) * w0 + pf(p, 25u) * w1 + pf(p, 28u) * w2;
+#if HIRES
+            if (unitMap)
+            {
+                uint size = st(s, S_TEXSIZE);
+                precise float invQ = 1.0 / fabsQ(iq);
+                gCorner = true;
+                gCornerU = is * invQ * float(size & 0xFFFFu) - float(gSubX) / 16.0;
+                gCornerV = it * invQ * float(size >> 16u) - float(gSubY) / 16.0;
+            }
+#endif
             texel = sampleTexture(s, is, it, iq, 0u, 0u);
         }
+#if HIRES
+        gCorner = false;
+#endif
         color = combineTexture(s, color, texel);
     }
     uint fogs = pw(p, 32u);

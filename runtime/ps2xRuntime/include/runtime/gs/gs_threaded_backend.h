@@ -3,14 +3,22 @@
 #include "runtime/gs/gs_backend.h"
 #include "runtime/gs/gs_backend_state.h"
 
+#include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
+
+namespace GSRing
+{
+    struct Collected;
+}
 
 class GSThreadedBackend final : public GSRasterBackend, public GSBackendStateAccess
 {
@@ -54,6 +62,17 @@ public:
 
     GSRasterBackend &Inner() { return *m_inner; }
 
+    // Bug recorder GS ring (gs_recording.h GSRing; the game-thread side is GSRingRecorderBackend). EnableRing before the
+    // first command; RingMark at every field change (restart: VRAM changed outside the stream); RingRecord adds a
+    // .gsr record the queue does not carry (Reset, ClearFramebuffer run synchronously through Op::Call).
+    void EnableRing();
+    void RingMark(uint64_t tick, const std::array<uint64_t, 7> &display, bool restart);
+    void RingRecord(uint8_t op, const void *payload, uint32_t size);
+    static bool RingActive();
+    static std::shared_ptr<GSRing::Collected> RingCollect(int waitMs, size_t keepSegments);
+    static bool RingWrite(const GSRing::Collected &collected, const std::string &path, std::string &summary);
+    static std::string RingStats();
+
 private:
     enum class Op : uint8_t
     {
@@ -72,6 +91,8 @@ private:
         RawGif,
         VSync,
         GsReset,
+        RingMark,   // bug recorder: field mark (RingMarkPayload)
+        RingRecord, // bug recorder: one .gsr record (op byte + payload), nothing to execute
     };
 
     void Enqueue(Op op, const void *payload, uint32_t size);
@@ -80,6 +101,8 @@ private:
     void RunOnWorker(const std::function<void()> &function) const;
     void WorkerLoop();
     void Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBatch &draw);
+    void RingAtMark(const uint8_t *payload, uint32_t opOffset, const GSPrimitiveBatch &draw);
+    void RingCapture(const std::vector<uint8_t> &chunk);
 
     std::unique_ptr<GSRasterBackend> m_inner;
     bool m_rawGif = false; // m_inner->WantsRawGif(), read without going to the worker
@@ -102,5 +125,6 @@ private:
     bool m_stop = false;
 
     mutable std::mutex m_execMutex;
+    std::atomic<bool> m_ringEnabled{false};
     std::thread m_worker;
 };

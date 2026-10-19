@@ -6,6 +6,9 @@ rem then the first *.iso that boots SLUS_210.75 in game\ next to this file. Set 
 rem to use another one.
 rem Log of the last session: build\port\bin\logs\play_last.log (the one before is kept as play_<time>.log).
 cd /d "%~dp0"
+rem Load every known hardware raster shader (build\port\bin\game_data\gs_shaders\hw_keys.txt) in the first seconds
+rem instead of on first use, so entering a room does not hitch on a shader compile (same as the 2K launcher).
+set PS2X_GS_HW_PRELOAD=1
 rem Per-2 s EE pacing line ([vblank-stats]) in the log.
 set PS2X_PACING_STATS=1
 if not exist "build\port\bin\logs" mkdir "build\port\bin\logs"

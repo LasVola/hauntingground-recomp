@@ -101,28 +101,31 @@ namespace ps2x::iop::detail
         m_file.read(reinterpret_cast<char *>(destination), static_cast<std::streamsize>(available));
     }
 
-    void VirtualMemoryCard::write(uint64_t address, const uint8_t *source, size_t size)
+    bool VirtualMemoryCard::write(uint64_t address, const uint8_t *source, size_t size)
     {
+        // Past the card end: nothing stored and still acknowledged, as before (a bounds question, not a host failure).
         if (address >= kImageSize)
-            return;
+            return true;
         const size_t available = static_cast<size_t>(std::min<uint64_t>(size, kImageSize - address));
         m_file.clear();
         m_file.seekp(static_cast<std::streamoff>(address));
         m_file.write(reinterpret_cast<const char *>(source), static_cast<std::streamsize>(available));
         m_file.flush();
-        // Log only (sweep L7): the game still gets its ACK, as before, but a failed host write is no longer silent.
+        // A failed host seek/write/flush returns false: the SIO2 command (0x42 write, 0x82 erase) then gets no response
+        // instead of an ACK, so MCMAN sees a failed card access rather than a save that was never stored.
         if (!m_file && m_ioErrors < 8u)
         {
             ++m_ioErrors;
             std::fprintf(stderr, "[SIO2] ERROR: memory card %s: host write of %zu bytes at 0x%llx failed\n",
                          m_path.string().c_str(), available, static_cast<unsigned long long>(address));
         }
+        return static_cast<bool>(m_file);
     }
 
-    void VirtualMemoryCard::eraseBlock(uint64_t address)
+    bool VirtualMemoryCard::eraseBlock(uint64_t address)
     {
         const std::vector<uint8_t> blank(uint64_t{kRawPageSize} * kPagesPerBlock, uint8_t{0xFFu});
-        write(address, blank.data(), blank.size());
+        return write(address, blank.data(), blank.size());
     }
 
     size_t VirtualMemoryCard::transfer(const std::vector<uint8_t> &command, std::vector<uint8_t> &response)
@@ -208,7 +211,8 @@ namespace ps2x::iop::detail
                 byte = next();
                 checksum ^= byte;
             }
-            write(m_transferAddress, data.data(), data.size());
+            if (!write(m_transferAddress, data.data(), data.size()))
+                return 0u;
             m_transferAddress += length;
             out.push_back(0x00u);
             out.push_back(kAck);
@@ -234,7 +238,8 @@ namespace ps2x::iop::detail
             break;
         }
         case kEraseBlock:
-            eraseBlock(m_transferAddress);
+            if (!eraseBlock(m_transferAddress))
+                return 0u;
             acknowledge(4u);
             break;
         case kBoot:

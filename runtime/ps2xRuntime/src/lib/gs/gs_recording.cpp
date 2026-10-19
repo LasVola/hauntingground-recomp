@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_recording.h"
+#include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/ps2_memory.h"
 
 #include <algorithm>
@@ -586,4 +587,156 @@ bool GSRecordingBackend::ImportState(const GSBackendState &state)
 {
     auto *access = dynamic_cast<GSBackendStateAccess *>(m_inner.get());
     return access && access->ImportState(state);
+}
+
+// ---- Bug recorder GS ring, game-thread side (the ring itself: gs_threaded_backend.cpp) --------------------------------
+
+GSRingRecorderBackend::GSRingRecorderBackend(std::unique_ptr<GSRasterBackend> inner, GSThreadedBackend *threaded,
+                                             const GSRegisters *regs)
+    : m_inner(std::move(inner)), m_threaded(threaded), m_regs(regs)
+{
+    m_threaded->EnableRing();
+}
+
+GSRingRecorderBackend::~GSRingRecorderBackend() = default;
+
+std::unique_ptr<GSRasterBackend> GSRingRecorderBackend::WrapFromEnvironment(std::unique_ptr<GSRasterBackend> inner,
+                                                                           const GSRegisters *regs)
+{
+    const char *value = std::getenv("PS2X_BUG_RECORDER");
+    if (!value || *value != '1' || !inner || !regs)
+        return inner;
+    if (const char *record = std::getenv("PS2X_GS_RECORD"); record && *record)
+    {
+        std::fprintf(stderr, "[bugrec] GS ring off: PS2X_GS_RECORD is set\n");
+        return inner;
+    }
+    auto *threaded = dynamic_cast<GSThreadedBackend *>(inner.get());
+    if (!threaded || inner->WantsRawGif())
+    {
+        std::fprintf(stderr, "[bugrec] GS ring off: it needs the GS thread with the native GS (PS2X_GS_THREAD, not PCSX2's GS)\n");
+        return inner;
+    }
+    return std::make_unique<GSRingRecorderBackend>(std::move(inner), threaded, regs);
+}
+
+void GSRingRecorderBackend::Mark()
+{
+    const uint64_t tick = m_regs->vsyncTick.load(std::memory_order_acquire);
+    if (tick == m_lastTick)
+        return;
+    m_lastTick = tick;
+    const std::array<uint64_t, 7> display{m_regs->pmode, m_regs->smode2, m_regs->dispfb1, m_regs->display1,
+                                          m_regs->dispfb2, m_regs->display2, m_regs->bgcolor};
+    m_threaded->RingMark(tick, display, m_restart);
+    m_restart = false;
+}
+
+void GSRingRecorderBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+{
+    m_inner->Initialize(vram, vramSize);
+    m_restart = true; // start-up or a save state: VRAM changed outside the stream, the ring starts again
+    m_lastTick = UINT64_MAX;
+}
+
+void GSRingRecorderBackend::Reset()
+{
+    Mark();
+    m_threaded->RingRecord(static_cast<uint8_t>(GSRecording::Op::Reset), nullptr, 0u);
+    m_inner->Reset();
+}
+
+void GSRingRecorderBackend::Submit(const GSPrimitiveBatch &batch)
+{
+    Mark();
+    m_inner->Submit(batch);
+}
+
+void GSRingRecorderBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+{
+    Mark();
+    m_inner->LoadClut(tex0, texclut);
+}
+
+void GSRingRecorderBackend::BeginTransfer(const GSTransferCommand &command)
+{
+    Mark();
+    m_inner->BeginTransfer(command);
+}
+
+void GSRingRecorderBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+{
+    Mark();
+    m_inner->UploadImage(data, sizeBytes);
+}
+
+void GSRingRecorderBackend::Flush()
+{
+    m_inner->Flush();
+}
+
+void GSRingRecorderBackend::TextureFlush()
+{
+    Mark();
+    m_inner->TextureFlush();
+}
+
+void GSRingRecorderBackend::Sync(GSSyncReason reason)
+{
+    m_inner->Sync(reason);
+}
+
+PresentationFrame GSRingRecorderBackend::Present(const GSPresentationRequest &request)
+{
+    return m_inner->Present(request);
+}
+
+bool GSRingRecorderBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+{
+    Mark();
+    const bool result = m_inner->ClearFramebuffer(context, rgba);
+    const ClearArgs args{context, rgba, result ? 1u : 0u};
+    m_threaded->RingRecord(static_cast<uint8_t>(GSRecording::Op::Clear), &args, sizeof(args));
+    return result;
+}
+
+uint32_t GSRingRecorderBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+{
+    return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
+}
+
+uint32_t GSRingRecorderBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+{
+    return m_inner->ReadVram(psm, base, bw, x, y);
+}
+
+void GSRingRecorderBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+{
+    Mark();
+    m_inner->WriteVram(psm, base, bw, x, y, value);
+}
+
+void GSRingRecorderBackend::SnapshotVram(std::vector<uint8_t> &out) const
+{
+    m_inner->SnapshotVram(out);
+}
+
+GSTransferSnapshot GSRingRecorderBackend::GetTransferSnapshot() const
+{
+    return m_inner->GetTransferSnapshot();
+}
+
+bool GSRingRecorderBackend::ExportState(GSBackendState &out)
+{
+    auto *access = dynamic_cast<GSBackendStateAccess *>(m_inner.get());
+    return access && access->ExportState(out);
+}
+
+bool GSRingRecorderBackend::ImportState(const GSBackendState &state)
+{
+    auto *access = dynamic_cast<GSBackendStateAccess *>(m_inner.get());
+    const bool ok = access && access->ImportState(state);
+    m_restart = true;
+    m_lastTick = UINT64_MAX;
+    return ok;
 }

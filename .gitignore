@@ -28,3 +28,8 @@ deps/
 logs/
 __pycache__/
 *.pyc
+# Game textures, GS replay streams and screenshots never go in either
+*.tex
+*.TEX
+*.gsr
+*.png

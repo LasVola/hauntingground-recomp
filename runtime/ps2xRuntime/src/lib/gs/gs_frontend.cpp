@@ -346,8 +346,13 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_privRegs = privRegs;
     if (!m_backend)
         m_backend = GSThreadedBackend::MakeDefault();
-    if (!dynamic_cast<GSRecordingBackend *>(m_backend.get()))
+    if (!dynamic_cast<GSRecordingBackend *>(m_backend.get()) && !dynamic_cast<GSRingRecorderBackend *>(m_backend.get()))
+    {
         m_backend = GSRecordingBackend::WrapFromEnvironment(std::move(m_backend), privRegs);
+        // Bug recorder (PS2X_BUG_RECORDER=1): the last ~1 s of GS commands in RAM (gs_recording.cpp GSRing).
+        if (!dynamic_cast<GSRecordingBackend *>(m_backend.get()))
+            m_backend = GSRingRecorderBackend::WrapFromEnvironment(std::move(m_backend), privRegs);
+    }
     m_rawGif = m_backend->WantsRawGif();
     m_backend->Initialize(vram, vramSize);
     reset();

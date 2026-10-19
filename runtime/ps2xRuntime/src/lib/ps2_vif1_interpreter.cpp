@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+
+// vu/ps2_vu1_core.cpp: content-keyed VU1 AOT opt-in (PS2X_VU1_CONTENT_AOT=1 or 2); declared here, not in ps2_vu1.h, which
+// every generated game file includes.
+bool ps2xVu1ContentAotEnabled() noexcept;
 #include <cstdlib>
 #include <smmintrin.h>
 
@@ -627,8 +631,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
                 {
-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
-                    markVU1CodeModified();
+                    // Default path is byte-for-byte the old behaviour. In content mode (1 or 2),
+                    // unchanged MPG uploads do not invalidate decoded/AOT generation caches.
+                    // Compare only this payload. CPU writes and state loads still invalidate.
+                    // Valid for the whole-image cache too (mode 2 tries it first): it is keyed by the
+                    // generation, and a skipped upload leaves every byte, so the image and its hash, unchanged.
+                    if (!ps2xVu1ContentAotEnabled() ||
+                        std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) != 0)
+                    {
+                        std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                        markVU1CodeModified();
+                    }
                 }
             }
             pos += mpgBytes;

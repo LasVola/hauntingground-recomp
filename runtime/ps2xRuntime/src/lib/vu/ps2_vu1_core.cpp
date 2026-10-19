@@ -5,6 +5,7 @@
 #include "ps2_vu1_detail.h"
 #define VU1_FORCE_INLINE inline
 #include "ps2_vu1_impl.inl"
+#include "ps2_vu1_content.h"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +14,7 @@
 #include <map>
 #include <bit>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +70,7 @@ namespace
     {
         std::vector<uint8_t> image;
         VU1InterpreterAccess::CompiledProgram program = nullptr;
+        uint64_t hash = 0; // fnv1a64 of image (the whole-image key)
     };
 
     struct Vu1CompiledRegistry
@@ -78,17 +81,27 @@ namespace
         const uint8_t *code = nullptr;
         uint64_t generation = ~0ull;
         VU1InterpreterAccess::CompiledProgram current = nullptr;
+        uint64_t currentHash = 0;  // whole-image key of the cached generation
+        bool missReported = false; // PS2X_VU1_CONTENT_AOT=2: [vu1-aot] miss report done for the cached generation
+        bool contentReported = false; // PS2X_VU1_CONTENT_AOT=2: content-covered miss report done for that generation
         bool enabled = true;
     };
+
+    // PS2X_VU1_CONTENT_AOT=2: what the last VU1 lookup on this thread returned, so runLoopWith knows the content
+    // descriptor (nullptr = whole-image code) without scanning the content registry. Only a hint: a different program
+    // pointer falls back to the scan (ps2xVu1FindContentProgram), the program -> descriptor mapping itself is fixed.
+    struct Vu1LookupHint
+    {
+        VU1InterpreterAccess::CompiledProgram program = nullptr;
+        const Vu1ContentProgram *content = nullptr;
+    };
+    thread_local Vu1LookupHint t_vu1LookupHint;
 
     // Log only (sweep R1): a VU1 micro memory image with no compiled (AOT) code runs every call in the interpreter, far
     // slower, with nothing in the log. Once per image: one line, and the image as vu1_<hash>.bin (the capture format
     // vu1_recomp reads) in PS2X_VU1_MISS_DIR (default logs/vu1_missing next to the exe's working folder; "0" = no file).
-    void reportUncompiledVu1Image(uint64_t hash, const uint8_t *vuCode, uint32_t codeSize)
+    std::string saveUncompiledVu1Image(uint64_t hash, const uint8_t *vuCode, uint32_t codeSize)
     {
-        static std::unordered_map<uint64_t, bool> reported;
-        if (reported.size() >= 256u || !reported.emplace(hash, true).second)
-            return;
         static const std::string directory = []
         {
             const char *value = std::getenv("PS2X_VU1_MISS_DIR");
@@ -111,11 +124,36 @@ namespace
                 std::fclose(file);
             }
         }
+        return saved;
+    }
+
+    void reportUncompiledVu1Image(uint64_t hash, const uint8_t *vuCode, uint32_t codeSize)
+    {
+        static std::unordered_map<uint64_t, bool> reported;
+        if (reported.size() >= 256u || !reported.emplace(hash, true).second)
+            return;
+        const std::string saved = saveUncompiledVu1Image(hash, vuCode, codeSize);
         std::fprintf(stderr, "[vu1-aot] image %016llx has no compiled code: VU1 runs it in the interpreter (slower); %s\n",
                      static_cast<unsigned long long>(hash), saved.c_str());
     }
 
-    VU1InterpreterAccess::CompiledProgram findCompiledVu1Image(Vu1CompiledRegistry &registry, const uint8_t *vuCode, uint32_t codeSize)
+    // PS2X_VU1_CONTENT_AOT=2: a whole-image miss that a content unit runs (exact, but about 3x the VU1 time of
+    // whole-image code). Once per image: one line and the same image file as above, so a later whole-image capture
+    // (vu1_recomp) can add the image and get the fast path back. Not "no compiled code": no call ran interpreted here.
+    void reportContentCoveredVu1Image(uint64_t hash, const uint8_t *vuCode, uint32_t codeSize)
+    {
+        static std::unordered_map<uint64_t, bool> reported;
+        if (reported.size() >= 256u || !reported.emplace(hash, true).second)
+            return;
+        const std::string saved = saveUncompiledVu1Image(hash, vuCode, codeSize);
+        std::fprintf(stderr, "[vu1-aot] image %016llx has no whole-image code: content units run it (exact, ~3x the VU1 time); %s\n",
+                     static_cast<unsigned long long>(hash), saved.c_str());
+    }
+
+    // reportMiss = false (PS2X_VU1_CONTENT_AOT=2): the caller reports a miss itself, with the code that ran the call (a content
+    // unit or the interpreter). registry.recent[0] is the entry for vuCode on return (its hash = the whole-image key).
+    VU1InterpreterAccess::CompiledProgram findCompiledVu1Image(Vu1CompiledRegistry &registry, const uint8_t *vuCode, uint32_t codeSize,
+                                                               bool reportMiss = true)
     {
         for (size_t index = 0; index < registry.recent.size(); ++index)
         {
@@ -132,7 +170,8 @@ namespace
         Vu1ImageCacheEntry entry;
         entry.image.assign(vuCode, vuCode + codeSize);
         entry.program = it == registry.programs.end() ? nullptr : it->second;
-        if (!entry.program)
+        entry.hash = hash;
+        if (!entry.program && reportMiss)
             reportUncompiledVu1Image(hash, vuCode, codeSize);
         constexpr size_t kRecentImages = 8u;
         if (registry.recent.size() < kRecentImages)
@@ -141,6 +180,140 @@ namespace
             registry.recent.back() = std::move(entry);
         std::swap(registry.recent.back(), registry.recent[0]);
         return registry.recent[0].program;
+    }
+
+
+    struct Vu1ContentCacheEntry
+    {
+        Vu1ContentProgram descriptor;
+        int8_t match = 0; // unknown / exact match / mismatch for the current generation
+        bool reported = false; // "[vu1-content] unit ... in use" written (once per unit and process)
+    };
+
+    struct Vu1ContentRegistry
+    {
+        std::vector<Vu1ContentCacheEntry> programs;
+        const PS2Memory *memory = nullptr;
+        const uint8_t *code = nullptr;
+        uint64_t generation = ~0ull;
+        size_t recent = 0u;
+        int8_t known = 0; // unknown / some unit's verified bytes are all resident / none (for the current generation)
+    };
+
+    Vu1ContentRegistry &vu1ContentRegistry()
+    {
+        static Vu1ContentRegistry result;
+        return result;
+    }
+
+    bool contentCoversPc(const Vu1ContentProgram &program, uint32_t pc)
+    {
+        if ((pc & 7u) != 0u)
+            return false;
+        for (uint32_t i = 0u; i < program.spanCount; ++i)
+        {
+            const auto &span = program.spans[i];
+            if (pc >= span.offset && pc - span.offset < span.size)
+                return true;
+        }
+        return false;
+    }
+
+    // `known` (set on a miss): the resident code is content-known (some unit's verified bytes are all resident), so a PC
+    // without a unit is one the units leave to the interpreter on purpose (program-end tails, tail_exclude.py), and the
+    // caller must not run inexact whole-image code there. Unknown code keeps the whole-image path.
+    // computeKnown = false (PS2X_VU1_CONTENT_AOT=2, whole-image registry already missed): a miss goes to the interpreter
+    // either way, so the once-per-generation `known` scan is skipped (`known` stays false). `descriptor` (optional): the
+    // unit behind a returned program.
+    VU1InterpreterAccess::CompiledProgram lookupContentVu1Program(
+        const uint8_t *code, uint32_t codeSize, const PS2Memory *memory, uint32_t pc, bool &known,
+        bool computeKnown = true, const Vu1ContentProgram **descriptor = nullptr)
+    {
+        known = false;
+        // Use the memory owner's generation, including CPU stores and save-state loads.
+        // Detached buffers are not eligible for this generation cache.
+        if (!ps2xVu1ContentAotEnabled() || !memory || codeSize != PS2_VU1_CODE_SIZE ||
+            code != memory->getVU1Code())
+            return nullptr;
+        auto &registry = vu1ContentRegistry();
+        if (registry.programs.empty())
+            return nullptr;
+        const uint64_t generation = memory->getVU1CodeGeneration();
+        if (registry.memory != memory || registry.code != code || registry.generation != generation)
+        {
+            registry.memory = memory;
+            registry.code = code;
+            registry.generation = generation;
+            registry.known = 0;
+            for (auto &entry : registry.programs)
+                entry.match = 0;
+        }
+        const auto tryEntry = [&](size_t index) -> VU1InterpreterAccess::CompiledProgram
+        {
+            auto &entry = registry.programs[index];
+            const auto &program = entry.descriptor;
+            if (entry.match < 0 || !contentCoversPc(program, pc))
+                return nullptr;
+            // Recheck positive matches on every run boundary. This also fails closed
+            // if a tool writes through a raw code pointer without a generation bump,
+            // or an allocator reuses the same owner/code addresses. Negative caching
+            // can only lose an optimization, never authorize stale compiled bytes.
+            {
+                entry.match = 1;
+                for (uint32_t i = 0u; i < program.spanCount; ++i)
+                {
+                    const auto &span = program.spans[i];
+                    if (std::memcmp(code + span.offset, span.bytes, span.size) != 0)
+                    {
+                        entry.match = -1;
+                        break;
+                    }
+                }
+            }
+            if (entry.match != 1)
+                return nullptr;
+            registry.recent = index;
+            if (!entry.reported)
+            {
+                // Proof line for hidden runs (at most one per unit): this unit's code ran at least once.
+                entry.reported = true;
+                std::fprintf(stderr, "[vu1-content] unit %016llx in use (first entry pc 0x%x)\n",
+                             static_cast<unsigned long long>(program.key), pc);
+            }
+            if (descriptor)
+                *descriptor = &program;
+            return program.program;
+        };
+        if (const auto program = tryEntry(registry.recent))
+            return program;
+        for (size_t i = 0u; i < registry.programs.size(); ++i)
+            if (i != registry.recent)
+                if (const auto program = tryEntry(i))
+                    return program;
+        if (!computeKnown)
+            return nullptr;
+        if (registry.known == 0)
+        {
+            // Once per code generation. A stale "known" can only send a call to the interpreter; a stale "unknown" to
+            // the whole-image path the game used before content units.
+            registry.known = -1;
+            for (auto &entry : registry.programs)
+            {
+                bool all = entry.match != -1;
+                for (uint32_t i = 0u; all && i < entry.descriptor.spanCount; ++i)
+                {
+                    const auto &span = entry.descriptor.spans[i];
+                    all = std::memcmp(code + span.offset, span.bytes, span.size) == 0;
+                }
+                if (all)
+                {
+                    registry.known = 1;
+                    break;
+                }
+            }
+        }
+        known = registry.known == 1;
+        return nullptr;
     }
 
     struct Vu1Trace
@@ -155,6 +328,7 @@ namespace
         std::vector<uint8_t> previous;
         uint64_t records = 0;
         uint64_t skipped = 0;
+        bool pendingEnd = false; // a start record was written; its end record (V1TE) follows the run
     };
 
     Vu1Trace *vu1Trace()
@@ -188,8 +362,36 @@ namespace
     // F8 in the game window (ps2_runtime.cpp) asks for a trace of the next few fields without PS2X_VU1_TRACE.
     std::atomic<uint32_t> g_vu1TraceRequestFields{0u};
     Vu1Trace *g_vu1HotkeyTrace = nullptr;
+    // How the current VU1 run was entered, for the trace (PS2X_VU1_TRACE records, format V1T2): 1 = execute (MSCAL),
+    // 2 = resume (MSCNT), 0 = other. Set by VU1Interpreter::execute/resume.
+    thread_local uint32_t t_vu1EntryKind = 0u;
 
-    void traceVu1Run(VU1Interpreter &vu, const uint8_t *vuCode, uint32_t codeSize, const uint8_t *vuData, uint32_t dataSize,
+    // Sparse VU data diff: (qword index, qword count) runs of the qwords that differ from `previous`, then 0xFFFF.
+    void writeVu1DataDiff(FILE *file, const uint8_t *vuData, const std::vector<uint8_t> &previous, uint32_t dataSize)
+    {
+        const uint32_t qwords = dataSize / 16u;
+        for (uint32_t index = 0; index < qwords;)
+        {
+            if (std::memcmp(vuData + index * 16u, previous.data() + index * 16u, 16u) == 0)
+            {
+                ++index;
+                continue;
+            }
+            uint32_t end = index + 1u;
+            while (end < qwords && end - index < 0xFFFFu &&
+                   std::memcmp(vuData + end * 16u, previous.data() + end * 16u, 16u) != 0)
+                ++end;
+            const uint16_t header[2] = {static_cast<uint16_t>(index), static_cast<uint16_t>(end - index)};
+            std::fwrite(header, sizeof(header), 1, file);
+            std::fwrite(vuData + index * 16u, 16u, end - index, file);
+            index = end;
+        }
+        const uint16_t terminator[2] = {0xFFFFu, 0u};
+        std::fwrite(terminator, sizeof(terminator), 1, file);
+    }
+
+    // Returns true when it wrote a start record: VU1Interpreter::run then calls traceVu1RunEnd after the run.
+    bool traceVu1Run(VU1Interpreter &vu, const uint8_t *vuCode, uint32_t codeSize, const uint8_t *vuData, uint32_t dataSize,
                      PS2Memory *memory, uint32_t maxCycles)
     {
         if (const uint32_t fields = g_vu1TraceRequestFields.exchange(0u); fields != 0u && memory)
@@ -213,7 +415,7 @@ namespace
         }
         Vu1Trace *trace = g_vu1HotkeyTrace ? g_vu1HotkeyTrace : vu1Trace();
         if (!trace || !memory || dataSize != 0x4000u || codeSize != 0x4000u)
-            return;
+            return false;
         const uint64_t tick = memory->gs().vsyncTick.load();
         if (tick < trace->first || tick >= trace->last)
         {
@@ -225,16 +427,23 @@ namespace
                              static_cast<unsigned long long>(trace->skipped));
                 std::fflush(stderr);
             }
-            return;
+            return false;
         }
         if (!trace->file)
-            return;
-        VU1InterpreterAccess::TraceState state;
-        if (!VU1InterpreterAccess::traceCapture(vu, state))
+            return false;
+        // V1T2 (Haunting Ground 2026-10-18): every call is written, so an offline replay can chain them. A call entered
+        // with VU pipeline writes still in flight (resume after a cycle-budget stop) cannot be restored from the record
+        // alone: it keeps only the visible state and flag bit 0x100 (counted as "skipped" as before).
+        VU1InterpreterAccess::TraceState state{};
+        const bool captured = VU1InterpreterAccess::traceCapture(vu, state);
+        if (!captured)
         {
+            state = VU1InterpreterAccess::TraceState{};
+            state.state = vu.state();
+            state.cycle = vu.state().cycles;
             ++trace->skipped;
-            return;
         }
+        const uint32_t recordFlags = (t_vu1EntryKind & 0xFFu) | (captured ? 0u : 0x100u);
         const uint64_t generation = memory->getVU1CodeGeneration();
         if (trace->memory != memory || trace->generation != generation)
         {
@@ -254,33 +463,60 @@ namespace
         }
         if (trace->previous.size() != dataSize)
             trace->previous.assign(dataSize, 0u);
-        const uint32_t magic = 0x52543156u;
+        const uint32_t magic = 0x32543156u; // "V1T2": V1TR + flags word
         std::fwrite(&magic, 4, 1, trace->file);
         std::fwrite(&maxCycles, 4, 1, trace->file);
         std::fwrite(&trace->imageHash, 8, 1, trace->file);
         std::fwrite(&tick, 8, 1, trace->file);
+        std::fwrite(&recordFlags, 4, 1, trace->file);
         std::fwrite(&state, sizeof(state), 1, trace->file);
-        const uint32_t qwords = dataSize / 16u;
-        for (uint32_t index = 0; index < qwords;)
-        {
-            if (std::memcmp(vuData + index * 16u, trace->previous.data() + index * 16u, 16u) == 0)
-            {
-                ++index;
-                continue;
-            }
-            uint32_t end = index + 1u;
-            while (end < qwords && end - index < 0xFFFFu &&
-                   std::memcmp(vuData + end * 16u, trace->previous.data() + end * 16u, 16u) != 0)
-                ++end;
-            const uint16_t header[2] = {static_cast<uint16_t>(index), static_cast<uint16_t>(end - index)};
-            std::fwrite(header, sizeof(header), 1, trace->file);
-            std::fwrite(vuData + index * 16u, 16u, end - index, trace->file);
-            index = end;
-        }
-        const uint16_t terminator[2] = {0xFFFFu, 0u};
-        std::fwrite(terminator, sizeof(terminator), 1, trace->file);
+        writeVu1DataDiff(trace->file, vuData, trace->previous, dataSize);
         std::memcpy(trace->previous.data(), vuData, dataSize);
         ++trace->records;
+        trace->pendingEnd = true;
+        return true;
+    }
+
+    // V1TE end record (Haunting Ground 2026-10-18), written right after the run of a traced call: how it stopped, the
+    // effective end state, the MXCSR it ran under, its XGKICK packets (count, bytes, FNV-1a 64) and the VU data qwords
+    // the run changed. The next start record's data diff is then relative to this end, so it holds exactly the qwords
+    // written from outside VU1 (VIF unpacks, EE stores) between the two calls (offline replay: port_prep/vu1/tools).
+    void traceVu1RunEnd(VU1Interpreter &vu, const uint8_t *vuData, uint32_t dataSize, bool ended, uint32_t mxcsr,
+                        const std::vector<std::vector<uint8_t>> &packets)
+    {
+        Vu1Trace *trace = g_vu1HotkeyTrace ? g_vu1HotkeyTrace : vu1Trace();
+        if (!trace || !trace->pendingEnd)
+            return;
+        trace->pendingEnd = false;
+        if (!trace->file || dataSize != trace->previous.size())
+            return;
+        uint64_t packetBytes = 0u;
+        uint64_t packetHash = 0xCBF29CE484222325ull;
+        for (const auto &packet : packets)
+        {
+            const uint32_t size = static_cast<uint32_t>(packet.size());
+            const uint8_t *sizeBytes = reinterpret_cast<const uint8_t *>(&size);
+            for (uint32_t i = 0; i < 4u; ++i)
+                packetHash = (packetHash ^ sizeBytes[i]) * 0x100000001B3ull;
+            for (const uint8_t byte : packet)
+                packetHash = (packetHash ^ byte) * 0x100000001B3ull;
+            packetBytes += size;
+        }
+        const uint32_t magic = 0x45543156u; // "V1TE"
+        const uint32_t flags = ended ? 1u : 0u;
+        const uint64_t cycles = vu.state().cycles;
+        const uint32_t packetCount = static_cast<uint32_t>(packets.size());
+        const VU1State state = VU1InterpreterAccess::effectiveState(vu);
+        std::fwrite(&magic, 4, 1, trace->file);
+        std::fwrite(&flags, 4, 1, trace->file);
+        std::fwrite(&cycles, 8, 1, trace->file);
+        std::fwrite(&mxcsr, 4, 1, trace->file);
+        std::fwrite(&packetCount, 4, 1, trace->file);
+        std::fwrite(&packetBytes, 8, 1, trace->file);
+        std::fwrite(&packetHash, 8, 1, trace->file);
+        std::fwrite(&state, sizeof(state), 1, trace->file);
+        writeVu1DataDiff(trace->file, vuData, trace->previous, dataSize);
+        std::memcpy(trace->previous.data(), vuData, dataSize);
     }
 
     // Diagnostic (God Hand round 9, missing clipped stage geometry), inert unless PS2X_VU1_FRAMESTATS=<csv path>:
@@ -507,10 +743,12 @@ namespace
         return registry;
     }
 
-    VU1InterpreterAccess::CompiledProgram lookupCompiledVu1Program(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory)
+    // The whole-image program for the resident image, once per code generation (the lookup God Hand has always used).
+    // reportMiss = false: no [vu1-aot] report here (PS2X_VU1_CONTENT_AOT=2 reports after the content lookup, with what ran).
+    VU1InterpreterAccess::CompiledProgram wholeImageVu1Program(Vu1CompiledRegistry &registry, const uint8_t *vuCode, uint32_t codeSize,
+                                                               const PS2Memory *memory, bool reportMiss)
     {
-        Vu1CompiledRegistry &registry = vu1CompiledRegistry();
-        if (!registry.enabled || registry.programs.empty() || !memory)
+        if (registry.programs.empty())
             return nullptr;
         const uint64_t generation = memory->getVU1CodeGeneration();
         if (registry.memory != memory || registry.code != vuCode || registry.generation != generation)
@@ -518,9 +756,144 @@ namespace
             registry.memory = memory;
             registry.code = vuCode;
             registry.generation = generation;
-            registry.current = findCompiledVu1Image(registry, vuCode, codeSize);
+            registry.current = findCompiledVu1Image(registry, vuCode, codeSize, reportMiss);
+            registry.currentHash = registry.recent[0].hash;
+            registry.missReported = false;
+            registry.contentReported = false;
         }
         return registry.current;
+    }
+
+    VU1InterpreterAccess::CompiledProgram lookupCompiledVu1ProgramOrdered(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory,
+                                                                         uint32_t pc)
+    {
+        Vu1CompiledRegistry &registry = vu1CompiledRegistry();
+        if (!registry.enabled || !memory)
+            return nullptr;
+        if (ps2xVu1ContentAotMode() == 2)
+        {
+            // Fallback order (Haunting Ground default): whole-image code first, exactly the old fast path when the image
+            // is known (no content registry work at all on a hit); on a whole-image miss the exact content unit instead of
+            // the interpreter; the interpreter last. A whole-image result holds for the whole code generation, so a run
+            // and its budget-cut resumes stay on one kind of code until the next upload changes the bytes.
+            if (const auto whole = wholeImageVu1Program(registry, vuCode, codeSize, memory, false))
+            {
+                t_vu1LookupHint = {whole, nullptr};
+                return whole;
+            }
+            bool contentKnown = false; // not computed in this mode: a content miss goes to the interpreter either way
+            const Vu1ContentProgram *descriptor = nullptr;
+            if (const auto content = lookupContentVu1Program(vuCode, codeSize, memory, pc, contentKnown, false, &descriptor))
+            {
+                t_vu1LookupHint = {content, descriptor};
+                // Still a whole-image miss: the image goes to logs/vu1_missing (once per image) so a later whole-image
+                // capture can give it the fast path; the line says content code ran it, not the interpreter.
+                if (!registry.contentReported && !registry.programs.empty() && registry.code == vuCode)
+                {
+                    registry.contentReported = true;
+                    reportContentCoveredVu1Image(registry.currentHash, vuCode, codeSize);
+                }
+                return content;
+            }
+            // Both registries miss for this call: the interpreter runs it. The whole-image miss report (logs/vu1_missing,
+            // the input of the next whole-image capture) fires here, once per code generation (once per image inside).
+            if (!registry.programs.empty() && !registry.missReported && registry.code == vuCode)
+            {
+                registry.missReported = true;
+                reportUncompiledVu1Image(registry.currentHash, vuCode, codeSize);
+            }
+            return nullptr;
+        }
+        // Explicit opt-in: no change to legacy lookup order or identity by default.
+        // A successful content comparison avoids hashing unrelated stale tails.
+        bool contentKnown = false;
+        if (const auto content = lookupContentVu1Program(vuCode, codeSize, memory, pc, contentKnown))
+            return content;
+        if (contentKnown)
+            return nullptr; // content-known code, a PC its units leave to the interpreter (exact end-of-program drain)
+        return wholeImageVu1Program(registry, vuCode, codeSize, memory, true);
+    }
+
+    // Log only. [vu1-lookup] lines: at the first VU1 lookup the content mode (when PS2X_VU1_CONTENT_AOT is 1 or 2, or
+    // the stats are on) and, with PS2X_VU1_LOOKUP_STATS=1 (unset: on when PS2X_PACING_STATS=1, as both launchers set,
+    // in content mode 1 or 2), every ~2 s how the VU1 calls (runs and budget-cut resumes) since the last line started:
+    // whole-image code, a content unit, or the interpreter (no compiled code for that call). Off: one branch per lookup.
+    struct Vu1LookupStats
+    {
+        std::atomic<uint64_t> whole{0}, content{0}, interp{0}, lookups{0};
+        std::atomic<int64_t> nextPrintNs{0};
+        uint64_t lastWhole = 0, lastContent = 0, lastInterp = 0; // written only by the thread that won nextPrintNs
+    };
+
+    Vu1LookupStats *vu1LookupStats()
+    {
+        static Vu1LookupStats *stats = []() -> Vu1LookupStats *
+        {
+            const char *value = std::getenv("PS2X_VU1_LOOKUP_STATS");
+            const char *pacing = std::getenv("PS2X_PACING_STATS");
+            const int mode = ps2xVu1ContentAotMode();
+            // Unset: on with PS2X_PACING_STATS=1 only in content mode 1/2 (mode 0, God Hand's lookup, logs as before).
+            const bool on = value && *value ? std::strcmp(value, "0") != 0 : mode != 0 && pacing && *pacing == '1';
+            if (mode != 0 || on)
+            {
+                static const char *const kOrder[3] = {"whole-image code only (content units off)",
+                                                      "content units first, then whole-image code",
+                                                      "whole-image code first, content units on a whole-image miss, "
+                                                      "interpreter last"};
+                std::fprintf(stderr, "[vu1-lookup] PS2X_VU1_CONTENT_AOT mode %d: %s; %zu whole-image keys, %zu content units "
+                                     "registered; per-2 s call counts %s\n",
+                             mode, kOrder[mode >= 0 && mode <= 2 ? mode : 0], vu1CompiledRegistry().programs.size(),
+                             vu1ContentRegistry().programs.size(), on ? "on" : "off");
+            }
+            return on ? new Vu1LookupStats() : nullptr;
+        }();
+        return stats;
+    }
+
+    void countVu1Lookup(Vu1LookupStats &stats, VU1InterpreterAccess::CompiledProgram program)
+    {
+        // Kind of the code a lookup returned: mode 2 left the descriptor in the hint; mode 1 looks it up (not the default).
+        const int mode = ps2xVu1ContentAotMode();
+        if (!program)
+            stats.interp.fetch_add(1u, std::memory_order_relaxed);
+        else if (mode == 2 ? t_vu1LookupHint.program == program && t_vu1LookupHint.content != nullptr
+                           : mode == 1 && ps2xVu1FindContentProgram(program) != nullptr)
+            stats.content.fetch_add(1u, std::memory_order_relaxed);
+        else
+            stats.whole.fetch_add(1u, std::memory_order_relaxed);
+        if ((stats.lookups.fetch_add(1u, std::memory_order_relaxed) & 1023u) != 0u)
+            return;
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t next = stats.nextPrintNs.load(std::memory_order_relaxed);
+        if (next == 0)
+        {
+            stats.nextPrintNs.compare_exchange_strong(next, now + 2000000000ll, std::memory_order_acq_rel);
+            return;
+        }
+        if (now < next || !stats.nextPrintNs.compare_exchange_strong(next, now + 2000000000ll, std::memory_order_acq_rel))
+            return;
+        const uint64_t whole = stats.whole.load(std::memory_order_relaxed);
+        const uint64_t content = stats.content.load(std::memory_order_relaxed);
+        const uint64_t interp = stats.interp.load(std::memory_order_relaxed);
+        std::fprintf(stderr, "[vu1-lookup] calls since last line: whole-image %llu content %llu interpreter %llu "
+                             "(total %llu / %llu / %llu)\n",
+                     static_cast<unsigned long long>(whole - stats.lastWhole),
+                     static_cast<unsigned long long>(content - stats.lastContent),
+                     static_cast<unsigned long long>(interp - stats.lastInterp), static_cast<unsigned long long>(whole),
+                     static_cast<unsigned long long>(content), static_cast<unsigned long long>(interp));
+        stats.lastWhole = whole;
+        stats.lastContent = content;
+        stats.lastInterp = interp;
+    }
+
+    VU1InterpreterAccess::CompiledProgram lookupCompiledVu1Program(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint32_t pc)
+    {
+        Vu1LookupStats *const stats = vu1LookupStats(); // first: its mode line comes before any report of the first lookup
+        const VU1InterpreterAccess::CompiledProgram program = lookupCompiledVu1ProgramOrdered(vuCode, codeSize, memory, pc);
+        if (stats)
+            countVu1Lookup(*stats, program);
+        return program;
     }
 
     // VU0 micro mode, ahead-of-time compiled like VU1. The runtime backs the 4 KB VU0 code/data memories with 16 KB
@@ -1326,6 +1699,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
+    t_vu1EntryKind = 1u;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -1338,6 +1712,7 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
+    t_vu1EntryKind = 2u;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -1348,8 +1723,20 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     if (m_unit == Unit::VU1)
     {
         captureVu1Program(vuCode, codeSize, memory, m_state.pc);
-        traceVu1Run(*this, vuCode, codeSize, vuData, dataSize, memory, maxCycles);
-        if (vu1VerifyEnabled() && lookupCompiledVu1Program(vuCode, codeSize, memory))
+        if (traceVu1Run(*this, vuCode, codeSize, vuData, dataSize, memory, maxCycles))
+        {
+            // Traced call (PS2X_VU1_TRACE / F8): the normal run, its packets copied (still forwarded to the GIF) for
+            // the V1TE end record. The verify and frame-stats paths below are not combined with a trace.
+            Vu1PacketSink sink;
+            Vu1PacketSink *const outer = packetSink;
+            packetSink = &sink;
+            const uint32_t mxcsr = _mm_getcsr();
+            const bool ended = VU1InterpreterAccess::runLoop(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, true);
+            packetSink = outer;
+            traceVu1RunEnd(*this, vuData, dataSize, ended, mxcsr, sink.packets);
+            return;
+        }
+        if (vu1VerifyEnabled() && lookupCompiledVu1Program(vuCode, codeSize, memory, m_state.pc))
         {
             VU1InterpreterAccess::runVerified(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
             return;
@@ -1393,7 +1780,7 @@ bool VU1InterpreterAccess::runLoop(VU1Interpreter &vu, uint8_t *vuCode, uint32_t
 {
     const CompiledProgram compiled =
         !allowCompiled ? nullptr
-        : vu.m_unit == VU1Interpreter::Unit::VU1 ? lookupCompiledVu1Program(vuCode, codeSize, memory)
+        : vu.m_unit == VU1Interpreter::Unit::VU1 ? lookupCompiledVu1Program(vuCode, codeSize, memory, vu.m_state.pc)
                                                   : lookupCompiledVu0Program(vuCode, codeSize, memory);
     return runLoopWith(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, compiled);
 }
@@ -1414,11 +1801,31 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
     bool programEnded = false;
     const Vu1RunArgs compiledArgs{vuData, dataSize, &gs, memory, codeSize, budgetEnd};
     bool interpretNextPair = false;
+    // Content units (PS2X_VU1_CONTENT_AOT=1 or 2): outside the unit's verified pairs the compiled code is not even entered.
+    // Entering it there only to fall back would first fold the interpreter's in-flight VF/VI/ACC writes into the
+    // registers (runFast -> materializeWrites), so the end-of-program drain (flushPipelines) would stop before those
+    // writes' latency, and the VU1 cycle count (the EE's VIF1 busy time) would come out short. The units leave the last
+    // pairs before each E-bit stop to the interpreter for that drain (port_prep/vu1/tools/tail_exclude.py).
+    // PS2X_VU1_CONTENT_AOT=2: the lookup that returned `compiled` left its descriptor in t_vu1LookupHint (nullptr for
+    // whole-image code, which then runs exactly as with content AOT off); any other program pointer is looked up.
+    const Vu1ContentProgram *content = nullptr;
+    if (compiled && vu.m_unit == VU1Interpreter::Unit::VU1 && ps2xVu1ContentAotEnabled())
+        content = ps2xVu1ContentAotMode() == 2 && t_vu1LookupHint.program == compiled ? t_vu1LookupHint.content
+                                                                                       : ps2xVu1FindContentProgram(compiled);
     while (vu.m_cycle < budgetEnd && !vu.m_stopRequested)
     {
-        if (compiled && !interpretNextPair)
+        if (compiled && !interpretNextPair && (!content || contentCoversPc(*content, vu.m_state.pc)))
         {
             const StepResult result = compiled(vu, compiledArgs);
+            if (Vu1RunStatsHook *const hook = g_vu1RunStatsHook)
+            {
+                ++hook->compiledCalls;
+                hook->compiledFallbacks += result == StepResult::Fallback ? 1u : 0u;
+                hook->compiledBudget += result == StepResult::Budget ? 1u : 0u;
+                hook->compiledEnded += result == StepResult::Ended ? 1u : 0u;
+                if (hook->firstResult < 0)
+                    hook->firstResult = static_cast<int>(result);
+            }
             if (result == StepResult::Budget)
                 break;
             if (result == StepResult::Ended)
@@ -1450,6 +1857,8 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
         }
 
         const StepResult step = stepPair(vu, decoded, vuData, dataSize, gs, memory, codeSize, budgetEnd);
+        if (Vu1RunStatsHook *const hook = g_vu1RunStatsHook; hook && step != StepResult::Budget)
+            ++hook->interpretedPairs;
         if (step == StepResult::Budget)
             break;
         if (step == StepResult::Ended)
@@ -1561,7 +1970,7 @@ namespace
 void VU1InterpreterAccess::runVerified(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
                                        GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
-    runVerifiedWith(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, lookupCompiledVu1Program(vuCode, codeSize, memory), true);
+    runVerifiedWith(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, lookupCompiledVu1Program(vuCode, codeSize, memory, vu.m_state.pc), true);
 }
 
 bool VU1InterpreterAccess::runVerifiedWith(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
@@ -1803,6 +2212,76 @@ bool VU1InterpreterAccess::runVerifiedWith(VU1Interpreter &vu, uint8_t *vuCode, 
         std::fflush(stderr);
     }
     return diff.empty();
+}
+
+
+Vu1RunStatsHook *g_vu1RunStatsHook = nullptr;
+
+int ps2xVu1ContentAotMode() noexcept
+{
+    static const int mode = []
+    {
+        const char *value = std::getenv("PS2X_VU1_CONTENT_AOT");
+        if (!value)
+            return 0;
+        if (std::strcmp(value, "1") == 0 || std::strcmp(value, "first") == 0)
+            return 1;
+        if (std::strcmp(value, "2") == 0 || std::strcmp(value, "fallback") == 0)
+            return 2;
+        return 0;
+    }();
+    return mode;
+}
+
+bool ps2xVu1ContentAotEnabled() noexcept
+{
+    return ps2xVu1ContentAotMode() != 0;
+}
+
+void registerVu1ContentProgram(const Vu1ContentProgram &program)
+{
+    if (!program.program || !program.spans || program.spanCount == 0u || program.spanCount > 2048u)
+        return;
+    uint32_t end = 0u;
+    for (uint32_t i = 0u; i < program.spanCount; ++i)
+    {
+        const auto &span = program.spans[i];
+        if (!span.bytes || span.size == 0u || (span.offset & 7u) != 0u || (span.size & 7u) != 0u ||
+            span.offset < end || span.offset >= PS2_VU1_CODE_SIZE || span.size > PS2_VU1_CODE_SIZE - span.offset)
+            return;
+        end = span.offset + span.size;
+    }
+    auto &registry = vu1ContentRegistry();
+    // Idempotent startup registration. Keys are not a lookup trust boundary.
+    for (const auto &entry : registry.programs)
+        if (entry.descriptor.program == program.program)
+            return;
+    registry.programs.push_back({program, 0});
+}
+
+VU1InterpreterAccess::CompiledProgram ps2xVu1LookupCompiledProgram(const uint8_t *vuCode, uint32_t codeSize,
+                                                                   const PS2Memory *memory, uint32_t pc)
+{
+    return lookupCompiledVu1Program(vuCode, codeSize, memory, pc);
+}
+
+const Vu1ContentProgram *ps2xVu1FindContentProgram(VU1InterpreterAccess::CompiledProgram program)
+{
+    for (const auto &entry : vu1ContentRegistry().programs)
+        if (entry.descriptor.program == program)
+            return &entry.descriptor;
+    return nullptr;
+}
+
+size_t ps2xVu1ContentProgramCount()
+{
+    return vu1ContentRegistry().programs.size();
+}
+
+const Vu1ContentProgram *ps2xVu1ContentProgramAt(size_t index)
+{
+    const auto &programs = vu1ContentRegistry().programs;
+    return index < programs.size() ? &programs[index].descriptor : nullptr;
 }
 
 VU1InterpreterAccess::CompiledProgram findCompiledVu1ProgramByHash(uint64_t imageHash)

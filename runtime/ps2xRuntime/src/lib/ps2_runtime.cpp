@@ -2,6 +2,7 @@
 #include "ps2_runtime.h"
 #include "ps2_module_table.h"
 #include "runtime/ps2_save_state.h"
+#include "runtime/ps2_bug_recorder.h"
 #include "runtime/ps2_pnach.h"
 #include "runtime/ps2_game_menu.h"
 #include "runtime/ps2_controls_screen.h"
@@ -712,8 +713,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
     uint32_t width = 0u;
     uint32_t height = 0u;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch, width, height) || width == 0u || height == 0u)
+    uint32_t displayFbp = 0u;
+    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch, width, height, &displayFbp) || width == 0u || height == 0u)
     {
+        // No image this field (no display circuit on, or none yet): the window shows black. The bug recorder counts it
+        // as a black frame.
+        ps2x::bugrec::onBlankFrame(currentTick);
         diagnostic.hashValid = false;
         outWidth = s_lastWidth = 0u;
         outHeight = s_lastHeight = 0u;
@@ -730,6 +735,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
     }
     UpdateTexture(tex, s_scratch.data());
+    // Bug recorder (PS2X_BUG_RECORDER=1): a 320-px thumbnail of this frame into its RAM ring (no GPU work).
+    ps2x::bugrec::onPresentedFrame(s_scratch.data(), width, height, currentTick, displayFbp);
     if (hashImages)
     {
         const auto mix = [](uint32_t value)
@@ -2991,6 +2998,28 @@ void PS2Runtime::run()
     uint32_t lastHashHeight = 0u;
     bool hadHash = false;
     ps2_host_display::FpsOverlay fpsOverlay;
+    // F8 (and the bug recorder's test hook PS2X_BUGSHOT_TEST_FIELD=<field>): EE RAM + VU1 trace of the next 2 fields, and
+    // with the bug recorder on, a bug bundle (logs/bugshots/<time>_<field>/: the last ~3 s of frames, ~1 s of GS commands).
+    ps2x::bugrec::start();
+    const uint64_t bugshotTestField = ps2x::bugrec::testField();
+    bool bugshotTestDone = bugshotTestField == 0u;
+    const auto debugCapture = [this](const char *reason)
+    {
+        const unsigned long long tick = static_cast<unsigned long long>(m_memory.gs().vsyncTick.load());
+        char name[64];
+        std::snprintf(name, sizeof(name), "ram_%llu.bin", tick);
+        if (std::FILE *file = std::fopen(name, "wb"))
+        {
+            std::fwrite(m_memory.getRDRAM(), 1, PS2_RAM_SIZE, file);
+            std::fclose(file);
+        }
+        ps2xRequestVu1Trace(2u);
+        std::fprintf(stderr, "[F8] wrote %s, VU1 trace requested\n", name);
+        if (ps2x::bugrec::enabled())
+            ps2x::bugrec::requestBundle(reason, tick,
+                                        std::string("also written to the working folder: ") + name +
+                                            " (EE RAM) and vu1trace_<tick>.bin (VU1 trace of the next 2 fields)");
+    };
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         if (IsWindowMinimized())
@@ -3141,7 +3170,7 @@ void PS2Runtime::run()
         {
             std::string stateText;
             float stateAlpha = 0.0f;
-            if (ps2x::savestate::overlayMessage(stateText, stateAlpha))
+            if (ps2x::savestate::overlayMessage(stateText, stateAlpha) || ps2x::bugrec::overlayMessage(stateText, stateAlpha))
             {
                 const int fontSize = std::max(18, GetScreenHeight() / 30);
                 const int width = MeasureText(stateText.c_str(), fontSize);
@@ -3220,18 +3249,11 @@ void PS2Runtime::run()
         if (!controlsOpen && IsKeyPressed(KEY_F3))
             fpsOverlay.visible = !fpsOverlay.visible;
         if (!controlsOpen && IsKeyPressed(KEY_F8))
+            debugCapture("F8"); // VU1 trace of the next 2 fields (vu1trace_<tick>.bin), EE RAM (ram_<tick>.bin), bug bundle
+        if (!bugshotTestDone && eeScheduler().currentVSyncTick() >= bugshotTestField)
         {
-            // Debug capture: VU1 trace of the next 2 fields (vu1trace_<tick>.bin) plus the EE RAM (ram_<tick>.bin).
-            const unsigned long long tick = static_cast<unsigned long long>(m_memory.gs().vsyncTick.load());
-            char name[64];
-            std::snprintf(name, sizeof(name), "ram_%llu.bin", tick);
-            if (std::FILE *file = std::fopen(name, "wb"))
-            {
-                std::fwrite(m_memory.getRDRAM(), 1, PS2_RAM_SIZE, file);
-                std::fclose(file);
-            }
-            ps2xRequestVu1Trace(2u);
-            std::fprintf(stderr, "[F8] wrote %s, VU1 trace requested\n", name);
+            bugshotTestDone = true;
+            debugCapture("test hook (PS2X_BUGSHOT_TEST_FIELD, same path as F8)");
         }
 
         if (WindowShouldClose())

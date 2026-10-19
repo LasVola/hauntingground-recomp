@@ -709,6 +709,13 @@ struct GSGpuBackend::Impl
                 if (slot.buffer)
                     gl.DeleteBuffers(1, &slot.buffer);
             }
+            for (Snapshot &slot : snapshots)
+            {
+                if (slot.fence)
+                    gl.DeleteSync(slot.fence);
+                if (slot.buffer)
+                    gl.DeleteBuffers(1, &slot.buffer);
+            }
             for (GLuint query : presentStats.queries)
                 if (query)
                     gl.DeleteQueries(1, &query);
@@ -2282,6 +2289,39 @@ struct GSGpuBackend::Impl
         bin(primCount - 1u, drawX0, drawY0, drawX1, drawY1);
     }
 
+    // True when the triangle's texture coordinate is the screen position plus a constant (dU/dx = dV/dy = 1,
+    // dU/dy = dV/dx = 0, within 1/1024 texel per pixel): a 1:1 read such as a pass over its own target. STQ only with
+    // one Q for all three vertices (affine). Used above 1x only.
+    static bool unitTextureMapping(const GSDrawState &state, const GSVertex *const vs[3])
+    {
+        double u[3], v[3];
+        for (int i = 0; i < 3; ++i)
+        {
+            if (state.prim.fst)
+            {
+                u[i] = vs[i]->u / 16.0;
+                v[i] = vs[i]->v / 16.0;
+            }
+            else
+            {
+                if (vs[i]->q != vs[0]->q || vs[i]->q == 0.0f)
+                    return false;
+                u[i] = static_cast<double>(vs[i]->s) / vs[i]->q * state.textureWidth;
+                v[i] = static_cast<double>(vs[i]->t) / vs[i]->q * state.textureHeight;
+            }
+        }
+        const double e1x = vs[1]->x - vs[0]->x, e1y = vs[1]->y - vs[0]->y;
+        const double e2x = vs[2]->x - vs[0]->x, e2y = vs[2]->y - vs[0]->y;
+        const double det = e1x * e2y - e1y * e2x;
+        if (std::fabs(det) < 1.0 / 256.0)
+            return false;
+        const double du1 = u[1] - u[0], du2 = u[2] - u[0], dv1 = v[1] - v[0], dv2 = v[2] - v[0];
+        const double dudx = (du1 * e2y - du2 * e1y) / det, dudy = (e1x * du2 - e2x * du1) / det;
+        const double dvdx = (dv1 * e2y - dv2 * e1y) / det, dvdy = (e1x * dv2 - e2x * dv1) / det;
+        constexpr double eps = 1.0 / 1024.0;
+        return std::fabs(dudx - 1.0) < eps && std::fabs(dudy) < eps && std::fabs(dvdx) < eps && std::fabs(dvdy - 1.0) < eps;
+    }
+
     void addTriangle(const GSPrimitiveBatch &batch)
     {
         const GSDrawState &state = batch.state;
@@ -2333,6 +2373,8 @@ struct GSGpuBackend::Impl
             p[29u + i] = static_cast<uint32_t>(vs[i]->u) | (static_cast<uint32_t>(vs[i]->v) << 16u);
         }
         p[32] = static_cast<uint32_t>(v0.fog) | (static_cast<uint32_t>(v1.fog) << 8u) | (static_cast<uint32_t>(v2.fog) << 16u);
+        if (scale > 1u && state.prim.tme && !state.linearFilter && unitTextureMapping(state, vs))
+            p[36] = 1u; // the shaders read drawn pages at the native pixel's texel in the sample's own plane (drawTriangle)
         binTriangle(primCount - 1u, tri, minX, minY, maxX, maxY);
     }
 
@@ -2649,8 +2691,98 @@ struct GSGpuBackend::Impl
     };
     std::array<Download, 4> downloads{};
 
+    // Bug recorder checkpoints (BeginSnapshotAsync): native VRAM + the current CLUT slot copied into a persistently
+    // mapped buffer, picked up once its fence has passed (same pattern as the async present readback).
+    struct Snapshot
+    {
+        GLuint buffer = 0;
+        const uint8_t *mapped = nullptr;
+        GLsync fence = nullptr;
+        GSBackendState state;
+        std::function<void(std::vector<uint8_t> &&, GSBackendState &&)> done;
+    };
+    std::array<Snapshot, 3> snapshots{};
+    static constexpr size_t kSnapshotBytes = GSSwizzle::kMemorySize + 1024u;
+
+    void pollSnapshots()
+    {
+        for (Snapshot &slot : snapshots)
+        {
+            if (!slot.fence)
+                continue;
+            const GLenum status = gl().ClientWaitSync(slot.fence, 0u, 0ull);
+            if (status != kAlreadySignaled && status != kConditionSatisfied)
+                continue;
+            gl().DeleteSync(slot.fence);
+            slot.fence = nullptr;
+            std::vector<uint8_t> vram(slot.mapped, slot.mapped + GSSwizzle::kMemorySize);
+            std::array<uint32_t, 256> words{};
+            std::memcpy(words.data(), slot.mapped + GSSwizzle::kMemorySize, sizeof(words));
+            for (uint32_t i = 0; i < 256u; ++i)
+            {
+                slot.state.clut[i * 2u] = static_cast<uint16_t>(words[i]);
+                slot.state.clut[i * 2u + 1u] = static_cast<uint16_t>(words[i] >> 16u);
+            }
+            auto done = std::move(slot.done);
+            slot.done = nullptr;
+            GSBackendState state = std::move(slot.state);
+            slot.state = GSBackendState{};
+            if (done)
+                done(std::move(vram), std::move(state));
+        }
+    }
+
+    bool beginSnapshotAsync(std::function<void(std::vector<uint8_t> &&, GSBackendState &&)> done)
+    {
+        pollSnapshots();
+        Snapshot *slot = nullptr;
+        for (Snapshot &candidate : snapshots)
+            if (!candidate.fence)
+            {
+                slot = &candidate;
+                break;
+            }
+        if (!slot)
+            return false;
+        flushBatch();
+        if (!slot->buffer)
+        {
+            gl().GenBuffers(1, &slot->buffer);
+            gl().BindBuffer(kCopyWriteBuffer, slot->buffer);
+            const GLbitfield flags = kMapReadBit | kMapPersistentBit | kMapCoherentBit;
+            gl().BufferStorage(kCopyWriteBuffer, static_cast<GLsizeiptr>(kSnapshotBytes), nullptr, flags | kClientStorageBit);
+            slot->mapped = static_cast<const uint8_t *>(gl().MapBufferRange(kCopyWriteBuffer, 0, static_cast<GLsizeiptr>(kSnapshotBytes), flags));
+            if (!slot->mapped)
+            {
+                gl().DeleteBuffers(1, &slot->buffer);
+                slot->buffer = 0;
+                return false;
+            }
+        }
+        barrier();
+        gl().BindBuffer(kCopyReadBuffer, vramBuffer);
+        gl().BindBuffer(kCopyWriteBuffer, slot->buffer);
+        gl().CopyBufferSubData(kCopyReadBuffer, kCopyWriteBuffer, 0, 0, static_cast<GLsizeiptr>(GSSwizzle::kMemorySize));
+        gl().BindBuffer(kCopyReadBuffer, clutBuffer);
+        gl().CopyBufferSubData(kCopyReadBuffer, kCopyWriteBuffer, static_cast<GLintptr>(clutSlot) * 1024,
+                               static_cast<GLintptr>(GSSwizzle::kMemorySize), 1024);
+        // The rest of ExportState's state is host side (CLUT CBPs, transfer, local->host bytes).
+        slot->state = GSBackendState{};
+        slot->state.clutCbp = clutCbp;
+        slot->state.cachePageBase = UINT32_MAX;
+        slot->state.transfer = transfer;
+        slot->state.transferState = transferState;
+        slot->state.localToHost = localToHost;
+        slot->state.localToHostReadPos = localToHostReadPos;
+        slot->fence = gl().FenceSync(kSyncGpuCommandsComplete, 0u);
+        gl().Flush();
+        slot->done = std::move(done);
+        return true;
+    }
+
     void pollDownloads()
     {
+        pollSnapshots();
         for (Download &slot : downloads)
         {
             if (!slot.fence)
@@ -3142,6 +3274,14 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
         d.localToLocal();
     else if (command.direction == 1u)
         d.localToHostTransfer();
+}
+
+bool GSGpuBackend::BeginSnapshotAsync(std::function<void(std::vector<uint8_t> &&, GSBackendState &&)> done)
+{
+    Impl &d = *m_impl;
+    if (!d.ensure())
+        return false;
+    return d.beginSnapshotAsync(std::move(done));
 }
 
 bool GSGpuBackend::BeginDownloadAsync(const GSTransferCommand &command, std::function<void(std::vector<uint8_t> &&)> done)

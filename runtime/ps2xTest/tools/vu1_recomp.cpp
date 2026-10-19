@@ -19,7 +19,9 @@ PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[1] = {};
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -77,6 +79,123 @@ namespace
             hash *= 0x100000001B3ull;
         }
         return hash;
+    }
+
+    struct ContentManifest
+    {
+        uint64_t key = 0u;
+        std::vector<uint32_t> entries;
+        std::vector<bool> covered;
+        std::vector<uint8_t> signature;
+        uint32_t count = 0u;
+    };
+
+    uint64_t parseHex64(const std::string &text)
+    {
+        const size_t prefix = text.size() >= 2u && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') ? 2u : 0u;
+        size_t parsed = 0u;
+        const uint64_t value = std::stoull(text.substr(prefix), &parsed, 16);
+        if (parsed != text.size() - prefix)
+            throw std::runtime_error("invalid hexadecimal value: " + text);
+        return value;
+    }
+
+    uint32_t parseHex32(const std::string &text)
+    {
+        const uint64_t value = parseHex64(text);
+        if (value > UINT32_MAX)
+            throw std::runtime_error("hexadecimal value is too large: " + text);
+        return static_cast<uint32_t>(value);
+    }
+
+    uint32_t parseDecimal32(const std::string &text)
+    {
+        size_t parsed = 0u;
+        const uint64_t value = std::stoull(text, &parsed, 10);
+        if (parsed != text.size() || value > UINT32_MAX)
+            throw std::runtime_error("invalid decimal value: " + text);
+        return static_cast<uint32_t>(value);
+    }
+
+    ContentManifest readContentManifest(const std::filesystem::path &path, const std::vector<uint8_t> &code)
+    {
+        std::ifstream file(path);
+        std::string magic, keyText, entryCountText, pairCountText;
+        if (!(file >> magic >> keyText >> entryCountText >> pairCountText) || magic != "VU1CONTENT1")
+            throw std::runtime_error(path.string() + ": invalid VU1CONTENT1 header");
+
+        ContentManifest manifest;
+        manifest.key = parseHex64(keyText);
+        const uint32_t entryCount = parseDecimal32(entryCountText);
+        const uint32_t pairCount = parseDecimal32(pairCountText);
+        const uint32_t total = kCodeSize / 8u;
+        if (entryCount == 0u || pairCount == 0u || entryCount > total || pairCount > total)
+            throw std::runtime_error(path.string() + ": entry/pair count is out of bounds");
+
+        manifest.covered.assign(total, false);
+        uint32_t previousEntry = 0u;
+        for (uint32_t i = 0; i < entryCount; ++i)
+        {
+            std::string token;
+            if (!(file >> token))
+                throw std::runtime_error(path.string() + ": missing entry PC");
+            const uint32_t pc = parseHex32(token);
+            if ((pc & 7u) != 0u || pc >= kCodeSize || (i != 0u && pc <= previousEntry))
+                throw std::runtime_error(path.string() + ": entry PCs must be sorted, unique, aligned, and in range");
+            manifest.entries.push_back(pc);
+            previousEntry = pc;
+        }
+
+        uint32_t previousPair = 0u;
+        for (uint32_t i = 0; i < pairCount; ++i)
+        {
+            std::string token;
+            if (!(file >> token))
+                throw std::runtime_error(path.string() + ": missing pair index");
+            const uint32_t pair = parseDecimal32(token);
+            if (pair >= total || (i != 0u && pair <= previousPair))
+                throw std::runtime_error(path.string() + ": pair indices must be sorted, unique, and in range");
+            manifest.covered[pair] = true;
+            manifest.count = pair + 1u;
+            previousPair = pair;
+        }
+
+        std::string extra;
+        if (file >> extra)
+            throw std::runtime_error(path.string() + ": unexpected trailing token");
+        for (const uint32_t pc : manifest.entries)
+            if (!manifest.covered[pc / 8u])
+                throw std::runtime_error(path.string() + ": every entry PC must name a covered pair");
+        for (uint32_t pair = 0; pair < total; ++pair)
+            if (!manifest.covered[pair] &&
+                std::any_of(code.begin() + pair * 8u, code.begin() + pair * 8u + 8u, [](uint8_t b) { return b != 0u; }))
+                throw std::runtime_error(path.string() + ": .bin contains nonzero bytes outside the verified pair set");
+
+        std::vector<uint8_t> keyBytes;
+        constexpr char domain[] = "VU1CONTENT1";
+        keyBytes.insert(keyBytes.end(), domain, domain + sizeof(domain)); // includes the required NUL byte
+        const auto appendLe32 = [&](uint32_t value)
+        {
+            keyBytes.push_back(static_cast<uint8_t>(value));
+            keyBytes.push_back(static_cast<uint8_t>(value >> 8));
+            keyBytes.push_back(static_cast<uint8_t>(value >> 16));
+            keyBytes.push_back(static_cast<uint8_t>(value >> 24));
+        };
+        appendLe32(entryCount);
+        for (const uint32_t pc : manifest.entries)
+            appendLe32(pc);
+        appendLe32(pairCount);
+        for (uint32_t pair = 0; pair < total; ++pair)
+        {
+            if (!manifest.covered[pair])
+                continue;
+            appendLe32(pair);
+            keyBytes.insert(keyBytes.end(), code.begin() + pair * 8u, code.begin() + pair * 8u + 8u);
+        }
+        if (fnv1a64(keyBytes.data(), keyBytes.size()) != manifest.key)
+            throw std::runtime_error(path.string() + ": content key does not match entries and covered bytes");
+        manifest.signature = std::move(keyBytes);
+        return manifest;
     }
 
     std::string hex64(uint64_t value)
@@ -1485,7 +1604,8 @@ namespace
     // hash: the name the image is emitted and registered under. exactVu0: an image that may be a VU0 program keeps the
     // exact FMACs (the PS2X_VU0_FAST=0 variant). mayBeVu0Out: whether it fits in VU0's micro memory.
     bool writeImage(const std::filesystem::path &outDir, uint64_t hash, const std::vector<uint8_t> &code, uint32_t maxBlockPairs,
-                    std::map<std::string, uint32_t> &stats, bool exactVu0, bool *mayBeVu0Out)
+                    std::map<std::string, uint32_t> &stats, bool exactVu0, bool *mayBeVu0Out,
+                    const ContentManifest *content = nullptr)
     {
         VU1Interpreter vu(VU1Interpreter::Unit::VU1);
         uint32_t used = 0u;
@@ -1493,13 +1613,13 @@ namespace
             if (std::any_of(code.begin() + pc, code.begin() + pc + 8u, [](uint8_t b) { return b != 0u; }))
                 used = pc / 8u + 1u;
         const uint32_t total = kCodeSize / 8u;
-        const uint32_t count = std::min(total, used + 2u);
+        const uint32_t count = content ? content->count : std::min(total, used + 2u);
 
         Emitter emitter;
-        const bool mayBeVu0 = used * 8u <= 4096u;
+        const bool mayBeVu0 = !content && used * 8u <= 4096u;
         if (mayBeVu0Out)
             *mayBeVu0Out = mayBeVu0;
-        emitter.fastFmac = gFastFmac && (!mayBeVu0 || (gVu0Fast && !exactVu0));
+        emitter.fastFmac = !content && gFastFmac && (!mayBeVu0 || (gVu0Fast && !exactVu0));
         bool readsStatus = false;
         for (uint32_t pc = 0; pc + 8u <= code.size(); pc += 8u)
         {
@@ -1510,7 +1630,7 @@ namespace
             if (!(upper & 0x80000000u) && opHi >= 0x14u && opHi <= 0x17u)
                 readsStatus = true;
         }
-        emitter.noSticky = emitter.fastFmac && !readsStatus && !gSticky;
+        emitter.noSticky = !content && emitter.fastFmac && !readsStatus && !gSticky;
         stats[emitter.noSticky ? "images without sticky accumulation" : "images keeping sticky accumulation"] += 1u;
         emitter.pairs.resize(total);
         for (uint32_t index = 0; index < total; ++index)
@@ -1532,7 +1652,7 @@ namespace
         {
             Pair &p = emitter.pairs[index];
             const Pair &next = emitter.pairs[nextPc(p.pc) / 8u];
-            p.fallback = p.reserved || p.d.dBit || p.d.tBit;
+            p.fallback = p.reserved || p.d.dBit || p.d.tBit || (content && (!content->covered[index] || p.dynamic));
             if ((p.branch || p.d.eBit) && !plainPair(next))
                 p.fallback = true;
             if (p.branch && p.d.eBit)
@@ -1541,13 +1661,23 @@ namespace
             const uint32_t special = (p.d.upper & 3u) | ((p.d.upper >> 4) & 0x7Cu);
             if ((op == 0x2Eu || (op >= 0x3Cu && special == 0x2Eu)) && (fDest(p.d.upper) & 0xEu) != 0xEu && fDest(p.d.upper) != 0u)
                 p.fallback = true;
-            if (p.fallback)
-                ++stats["fallback pairs"];
             if (!p.d.iBit && lowerEmit(p.pc, p.d.lower, p.d.upper).generic)
                 ++stats["generic lower"];
             if (upperEmit(p.d.upper).generic)
                 ++stats["generic upper"];
         }
+        if (content)
+            for (uint32_t index = 0; index < count; ++index)
+            {
+                Pair &p = emitter.pairs[index];
+                const Pair &next = emitter.pairs[nextPc(p.pc) / 8u];
+                if ((p.branch || p.d.eBit) &&
+                    (!content->covered[nextPc(p.pc) / 8u] || next.fallback || next.dynamic || !plainPair(next)))
+                    p.fallback = true;
+            }
+        for (uint32_t index = 0; index < count; ++index)
+            if (emitter.pairs[index].fallback)
+                ++stats["fallback pairs"];
 
         // Flag readers reachable from each pair (see Emitter::flagLive): backwards fixed point over the static
         // control flow (fall-through, branch targets, delay slots; an E bit ends the program after its delay slot).
@@ -1650,7 +1780,8 @@ namespace
             emitter.usesTk = false;
             emitter.usesJt = false;
             emitter.exits.clear();
-            emitter.planSegments();
+            if (!content)
+                emitter.planSegments();
             std::string code;
             for (uint32_t index = start; index < end; ++index)
             {
@@ -1662,7 +1793,8 @@ namespace
                 code += emitter.emitSegment(segment);
             stats["known segments"] += static_cast<uint32_t>(emitter.segs.size());
             stats["self-looping segments"] += emitter.selfLoops;
-            out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::fastBlock<" << hex64(hash) << ", "
+            out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::" << "fastBlock"
+                << "<" << hex64(hash) << ", "
                 << block << "u>(VU1Interpreter &vu, Vu1FastCtx &ctx)\n{\n";
             out << "    uint64_t cyc = ctx.cycle;\n    const uint64_t budget = ctx.budget;\n    const uint8_t *const mem = ctx.mem;\n";
             out << "    uint32_t epc = 0u;\n";
@@ -1703,7 +1835,8 @@ namespace
                 text += blockTexts[block++];
             }
             char partName[64];
-            std::snprintf(partName, sizeof(partName), "vu1_%016" PRIx64 "_%u.cpp", hash, part++);
+            const char *filePrefix = content ? "vu1_content_" : "vu1_";
+            std::snprintf(partName, sizeof(partName), "%s%016" PRIx64 "_%u.cpp", filePrefix, hash, part++);
             std::ofstream partFile(outDir / partName, std::ios::binary);
             partFile << text;
             if (!partFile)
@@ -1713,26 +1846,200 @@ namespace
         std::ostringstream out;
         out << "#include \"ps2_vu1_impl.inl\"\n\n";
         for (uint32_t block = 0; block < blocks.size(); ++block)
-            out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::fastBlock<" << hex64(hash) << ", " << block
-                << "u>(VU1Interpreter &vu, Vu1FastCtx &ctx);\n";
+            out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::" << "fastBlock"
+                << "<" << hex64(hash) << ", " << block << "u>(VU1Interpreter &vu, Vu1FastCtx &ctx);\n";
         out << "\n";
-        out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::runImage<" << hex64(hash)
+        out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::" << "runImage"
+            << "<" << hex64(hash)
             << ">(VU1Interpreter &vu, const Vu1RunArgs &args)\n{\n    static constexpr FastBlock table[] = {\n";
         for (uint32_t index = 0; index < count; ++index)
-            out << "        &fastBlock<" << hex64(hash) << ", " << blockOf[index] << "u>,\n";
+        {
+            if (content && !content->covered[index])
+                out << "        nullptr,\n";
+            else
+                out << "        &" << "fastBlock" << "<" << hex64(hash) << ", " << blockOf[index] << "u>,\n";
+        }
         out << "    };\n    return runFast(vu, args, table, " << count << "u);\n}\n";
 
         char name[64];
-        std::snprintf(name, sizeof(name), "vu1_%016" PRIx64 ".cpp", hash);
+        const char *filePrefix = content ? "vu1_content_" : "vu1_";
+        std::snprintf(name, sizeof(name), "%s%016" PRIx64 ".cpp", filePrefix, hash);
         std::ofstream file(outDir / name, std::ios::binary);
         file << out.str();
         std::cout << name << ": " << count << " pairs, " << blocks.size() << " blocks, " << part << " parts\n";
         return static_cast<bool>(file);
     }
+
+    bool isGeneratedImageSource(const std::string &name)
+    {
+        constexpr size_t hashStart = 12u;
+        if (name.size() < hashStart + 20u || name.compare(0u, hashStart, "vu1_content_") != 0)
+            return false;
+        for (size_t i = hashStart; i < hashStart + 16u; ++i)
+            if (!((name[i] >= '0' && name[i] <= '9') || (name[i] >= 'a' && name[i] <= 'f') || (name[i] >= 'A' && name[i] <= 'F')))
+                return false;
+        if (name.compare(hashStart + 16u, 4u, ".cpp") == 0)
+            return true;
+        if (name[hashStart + 16u] != '_' || name.compare(name.size() - 4u, 4u, ".cpp") != 0 || name.size() < hashStart + 22u)
+            return false;
+        for (size_t i = hashStart + 17u; i < name.size() - 4u; ++i)
+            if (name[i] < '0' || name[i] > '9')
+                return false;
+        return true;
+    }
+
+    struct ContentUnit
+    {
+        uint64_t key;
+        std::vector<bool> covered;
+        std::vector<uint8_t> code;
+    };
+
+    // vu1_content_programs.cpp: one descriptor per unit, its verified pairs as contiguous spans with their exact bytes
+    // (the runtime compares them with the resident micro memory before it runs the unit), and
+    // registerGeneratedVu1ContentPrograms().
+    bool writeContentRegistry(const std::filesystem::path &outDir, const std::vector<ContentUnit> &units)
+    {
+        std::ostringstream out;
+        out << "#include \"ps2_vu1_content.h\"\n\n";
+        out << "// Generated by vu1_recomp --content: " << units.size() << " content units (exact FMACs, sticky status,\n";
+        out << "// normalized loads, no segments). Each span holds verified pairs only.\n";
+        for (const ContentUnit &unit : units)
+            out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::runImage<" << hex64(unit.key)
+                << ">(VU1Interpreter &, const Vu1RunArgs &);\n";
+        out << "\nnamespace\n{\n";
+        std::vector<uint32_t> spanCounts;
+        for (const ContentUnit &unit : units)
+        {
+            char name[64];
+            std::snprintf(name, sizeof(name), "%016" PRIX64, unit.key);
+            std::vector<std::pair<uint32_t, uint32_t>> spans; // first pair, pair count
+            for (uint32_t pair = 0; pair < unit.covered.size(); ++pair)
+            {
+                if (!unit.covered[pair])
+                    continue;
+                if (!spans.empty() && spans.back().first + spans.back().second == pair)
+                    ++spans.back().second;
+                else
+                    spans.push_back({pair, 1u});
+            }
+            for (size_t i = 0; i < spans.size(); ++i)
+            {
+                out << "    constexpr uint8_t kBytes_" << name << "_" << i << "[] = {";
+                for (uint32_t b = 0; b < spans[i].second * 8u; ++b)
+                {
+                    if (b % 16u == 0u)
+                        out << "\n        ";
+                    char t[8];
+                    std::snprintf(t, sizeof(t), "0x%02X,", unit.code[spans[i].first * 8u + b]);
+                    out << t;
+                }
+                out << "\n    };\n";
+            }
+            out << "    constexpr Vu1ContentSpan kSpans_" << name << "[] = {\n";
+            for (size_t i = 0; i < spans.size(); ++i)
+                out << "        {" << spans[i].first * 8u << "u, " << spans[i].second * 8u << "u, kBytes_" << name << "_" << i << "},\n";
+            out << "    };\n";
+            spanCounts.push_back(static_cast<uint32_t>(spans.size()));
+        }
+        out << "}\n\nvoid registerGeneratedVu1ContentPrograms()\n{\n    static const Vu1ContentProgram programs[] = {\n";
+        for (size_t u = 0; u < units.size(); ++u)
+        {
+            char name[64];
+            std::snprintf(name, sizeof(name), "%016" PRIX64, units[u].key);
+            out << "        {" << hex64(units[u].key) << ", kSpans_" << name << ", " << spanCounts[u] << "u, &VU1InterpreterAccess::runImage<"
+                << hex64(units[u].key) << ">},\n";
+        }
+        out << "    };\n    for (const Vu1ContentProgram &program : programs)\n        registerVu1ContentProgram(program);\n}\n";
+        std::ofstream file(outDir / "vu1_content_programs.cpp", std::ios::binary);
+        file << out.str();
+        std::cout << "vu1_content_programs.cpp: " << units.size() << " content units\n";
+        return static_cast<bool>(file);
+    }
+
+    int runContentMode(const std::filesystem::path &inputDir, const std::filesystem::path &outDir, uint32_t blockPairs)
+    {
+        if (gRawLoads)
+        {
+            std::cerr << "VU1_RECOMP_RAW_LOADS=1 is unsupported in --content mode\n";
+            return 2;
+        }
+        if (blockPairs == 0u)
+        {
+            std::cerr << "max-pairs-per-block must be greater than zero\n";
+            return 2;
+        }
+
+        std::filesystem::create_directories(outDir);
+        for (const auto &entry : std::filesystem::directory_iterator(outDir))
+            if (entry.is_regular_file() && entry.path().extension() == ".cpp" && isGeneratedImageSource(entry.path().filename().string()))
+                std::filesystem::remove(entry.path());
+
+        std::vector<std::filesystem::path> manifests;
+        for (const auto &entry : std::filesystem::directory_iterator(inputDir))
+            if (entry.is_regular_file() && entry.path().extension() == ".content")
+                manifests.push_back(entry.path());
+        std::sort(manifests.begin(), manifests.end());
+        if (manifests.empty())
+        {
+            std::cerr << inputDir << ": no .content manifests found\n";
+            return 1;
+        }
+
+        std::map<uint64_t, std::vector<uint8_t>> keys;
+        std::map<std::string, uint32_t> stats;
+        std::vector<ContentUnit> units;
+        for (const auto &manifestPath : manifests)
+        {
+            std::filesystem::path binPath = manifestPath;
+            binPath.replace_extension(".bin16k");
+            std::ifstream bin(binPath, std::ios::binary);
+            std::vector<uint8_t> code((std::istreambuf_iterator<char>(bin)), std::istreambuf_iterator<char>());
+            if (code.size() != kCodeSize)
+            {
+                std::cerr << binPath << ": expected " << kCodeSize << " bytes in the sibling .bin16k file\n";
+                return 1;
+            }
+
+            ContentManifest content = readContentManifest(manifestPath, code);
+            const auto [it, inserted] = keys.emplace(content.key, content.signature);
+            if (!inserted && it->second != content.signature)
+            {
+                std::cerr << manifestPath << ": content-key collision " << hex64(content.key) << "\n";
+                return 1;
+            }
+            if (!inserted)
+                continue;
+            if (!writeImage(outDir, content.key, code, blockPairs, stats, false, nullptr, &content))
+                return 1;
+            units.push_back({content.key, content.covered, code});
+        }
+        for (const auto &[name, value] : stats)
+            std::cout << name << ": " << value << "\n";
+        return writeContentRegistry(outDir, units) ? 0 : 1;
+    }
 }
 
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && std::string(argv[1]) == "--content")
+    {
+        if (argc < 4 || argc > 5)
+        {
+            std::cerr << "usage: vu1_recomp --content <inputs-dir> <out-dir> [max-pairs-per-block]\n";
+            return 2;
+        }
+        try
+        {
+            const uint32_t blockPairs = argc > 4 ? static_cast<uint32_t>(std::stoul(argv[4])) : kDefaultBlockPairs;
+            return runContentMode(argv[2], argv[3], blockPairs);
+        }
+        catch (const std::exception &error)
+        {
+            std::cerr << error.what() << "\n";
+            return 1;
+        }
+    }
     if (argc < 3)
     {
         std::cerr << "usage: vu1_recomp <capture-dir> <out-dir> [max-pairs-per-block]\n";
@@ -1745,7 +2052,8 @@ int main(int argc, char **argv)
     for (const auto &entry : std::filesystem::directory_iterator(outDir))
     {
         const std::string name = entry.path().filename().string();
-        if (name.rfind("vu1_", 0) == 0 && entry.path().extension() == ".cpp")
+        // vu1_content_* (the --content output, Haunting Ground) is not this mode's output: keep it.
+        if (name.rfind("vu1_", 0) == 0 && name.rfind("vu1_content_", 0) != 0 && entry.path().extension() == ".cpp")
             std::filesystem::remove(entry.path());
     }
 

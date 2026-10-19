@@ -3,7 +3,8 @@
 // @2fa53c4). Kept: the generic start-up (CPU check, crash reporter, settings file -> environment, disc check, runtime
 // set-up, function hooks, HLE bindings, diagnostics), hidden (headless) runs, a wall-clock time limit with a hang dump
 // and exit codes for scripted boots. Removed for Haunting Ground (2026-10-18, port_prep/WORKLOG.md): God Hand's SNR2
-// DLL load logger, high-resolution flip copy (flicker filter), F2 cheats and button prompts.
+// DLL load logger, high-resolution flip copy (flicker filter) and F2 cheats; God Hand's button prompts were replaced by
+// Haunting Ground's own (hg/button_prompts, 2026-10-18: the bound PC keys in the font's ten PS2 button cells).
 
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_async_vif.h"
@@ -15,6 +16,7 @@
 #include "runtime/gs/gs_gpu_backend.h"
 #include "runtime/gs/gs_pcsx2_backend.h"
 #include "runtime/gs/gs_threaded_backend.h"
+#include "hg/button_prompts.h"
 #include "hg/call_profile.h"
 #include "hg/call_trace.h"
 #include "hg/default_ini.h" // generated from hauntingground.ini by src/CMakeLists.txt
@@ -66,6 +68,12 @@
 // interpreted and nothing is declared or called here.
 #if defined(HG_HAS_VU1_PROGRAMS) && HG_HAS_VU1_PROGRAMS
 void registerGeneratedVu1Programs();
+#endif
+// generated/vu1/vu1_content_programs.cpp (vu1_recomp --content): content-keyed VU1 units, found by the bytes they execute
+// instead of a hash of the whole 16 KB micro memory (Haunting Ground uploads its 19 programs at VU address 0 per draw over
+// stale tails, so whole-image keys never stop changing). Design codex/vu1keyed/DESIGN.md, gate port_prep/vu1.
+#if defined(HG_HAS_VU1_CONTENT_PROGRAMS) && HG_HAS_VU1_CONTENT_PROGRAMS
+void registerGeneratedVu1ContentPrograms();
 #endif
 
 #if !defined(HG_ARCH_NAME)
@@ -629,6 +637,26 @@ int main(int argc, char *argv[])
     // slices, which the user heard as sounds "playing twice"; a rare stall gives a short dropout instead.
     // PS2X_AUDIO_STRETCH=1 turns it back on. User preference; untested on Haunting Ground.
     setDefaultEnv("PS2X_AUDIO_STRETCH", "0");
+#if defined(HG_HAS_VU1_CONTENT_PROGRAMS) && HG_HAS_VU1_CONTENT_PROGRAMS
+    // VU1 content-keyed AOT on by default (Haunting Ground only; the runtime's default is off, God Hand never sets it):
+    // HG uploads its 19 VU1 programs at VU address 0 over stale tails, so whole-image keys keep missing (the 12:44 play's
+    // 3 s drop ran image 7500d7da interpreted). Offline exactness gate 2026-10-18 (port_prep/vu1, hg_vu1_replay): 3.3 M
+    // traced calls, AOT == interpreter in state, cycles, VU memory and GIF packets.
+    // Mode 2 (fallback, 2026-10-18 VU1 hybrid): whole-image code first, exactly the old fast path when the image is
+    // known; the content unit only on a whole-image miss (instead of the interpreter); the interpreter last. Mode 1
+    // (content first) cost ~3.2x the whole-image VU1 time (hidden 3x A/B: 45.5 vs 60.0 fields/s, EE 80-85% vs 37%).
+    // PS2X_VU1_CONTENT_AOT=1 = content first, 0 = whole-image only.
+    setDefaultEnv("PS2X_VU1_CONTENT_AOT", "2");
+#endif
+    // Bug recorder on by default (Haunting Ground only; the runtime's default is off): the last ~3 s of frames and ~1 s of GS
+    // commands stay in RAM, F8 or a black flash writes logs/bugshots/<time>_<field>/ (port_prep/WORKLOG.md "2026-10-19
+    // bug recorder"). HG_BUG_RECORDER=0 turns it off; HG_BUGSHOT_TEST_FIELD=<field> fires the F8 path once (test hook).
+    {
+        const char *recorder = std::getenv("HG_BUG_RECORDER");
+        setDefaultEnv("PS2X_BUG_RECORDER", recorder && *recorder == '0' ? "0" : "1");
+        if (const char *field = std::getenv("HG_BUGSHOT_TEST_FIELD"); field && *field)
+            setDefaultEnv("PS2X_BUGSHOT_TEST_FIELD", field);
+    }
     GSThreadedBackend::SetEnabledByDefault(true);
     GSThreadedBackend::SetGpuByDefault(true);
     GSGpuBackend::SetAsyncPresentDefault(true);
@@ -697,8 +725,12 @@ int main(int argc, char *argv[])
             HG_INFO(Ee, "EE FPU host mode: round toward zero, denormals flushed");
         });
         hg::installHleBindings(runtime); // SLUS_210.75 table: hg/hg_sdk_functions.inc (port_prep/hle-bindings)
+        hg::button_prompts::install(runtime); // PC keys in the PS2 button icons (port_prep/prompts/DESIGN.md); HG_PROMPTS=0 = off
 #if defined(HG_HAS_VU1_PROGRAMS) && HG_HAS_VU1_PROGRAMS
         registerGeneratedVu1Programs();
+#endif
+#if defined(HG_HAS_VU1_CONTENT_PROGRAMS) && HG_HAS_VU1_CONTENT_PROGRAMS
+        registerGeneratedVu1ContentPrograms(); // used only with PS2X_VU1_CONTENT_AOT=1 or 2
 #endif
         // TODO(hg): a "game_frame" observer on Haunting Ground's main-loop function (ps2_host_display::noteGameFrame for
         // the F3 overlay), as Urban did on 0x128dc0. Not known yet: OpenHuey's main 0x20D860 is only a lead (unverified).

@@ -64,6 +64,12 @@ public:
     // PS2X_GS_ASYNC_DOWNLOAD=0 turns it off.
     bool BeginDownloadAsync(const GSTransferCommand &command, std::function<void(std::vector<uint8_t> &&)> done);
 
+    // Bug recorder checkpoint (gs_recording.cpp GSRingRecorderBackend): the native VRAM and the state ExportState would
+    // give at this point of the stream, without waiting for the GPU. The VRAM and current CLUT are copied on the GPU into
+    // a mapped buffer (the async-present readback pattern) and done receives them on this thread, from a later call of
+    // this or of Present, once the copy has finished. False when no slot is free or the back end is not up.
+    bool BeginSnapshotAsync(std::function<void(std::vector<uint8_t> &&, GSBackendState &&)> done);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
