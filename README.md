@@ -67,7 +67,14 @@ Not tested yet:
   old snapshot folders when you no longer need them.
 - **VU1 hybrid ahead-of-time code:** VU1 programs run whole-image compiled code first, then content-keyed compiled
   units where no whole-image code exists, then the interpreter (see "VU1 programs").
-- Fixes: shadow-volume edges at internal resolutions above 1x; a failed memory card write is no longer reported to
+- **Japanese-style hiding notices (optional):** `[Game] HideHidingPrompts=1` in `hauntingground.ini` hides the
+  "Hiding..." and "Coast Clear" notices, as the Japanese release (Demento) does; "Flee!" and "Status Restored" stay.
+  Default 0 = the US game's notices.
+- **Black flash fixed (hidden test runs):** the picture is now taken at the vertical blank in GS command order, so the
+  screen can no longer be shown in the moment between the game's per-frame clear of the display buffer and its copy
+  into it (`PS2X_PRESENT_AT_VBLANK=0` restores the old path).
+- Fixes: texture sampling at the screen and buffer edges at internal resolutions above 1x (clamped on the fine sample
+  grid); shadow-volume edges at internal resolutions above 1x; a failed memory card write is no longer reported to
   the game as written; the two audio debug dumps have separate switches (`PS2X_AUDIO_DUMP` = SPU2 output,
   `PS2X_AUDIO_BACKEND_DUMP` = the audio backend's WAV) instead of sharing one.
 
@@ -153,10 +160,9 @@ These are the steps used during development. A build from a completely fresh clo
 
 ## Known issues
 
-- **Black flash (under investigation):** the screen sometimes goes black for a moment. The cause is not known. In
-  hidden test runs a black frame was seen only with the GPU profiler on, and there the game's own picture was not
-  black (the black frame came from the port's presentation path). The bug recorder saves a snapshot of such a flash
-  by itself; pressing F8 right after one also helps.
+- **Black flash:** fixed in hidden test runs (see "New since the first upload"); not yet confirmed in human play. The
+  short black moment between the CRI and Dolby logos at boot is the game's own transition, not a bug. The bug recorder
+  still saves a snapshot of any black flash by itself.
 - **Cutscene glitches (under investigation):** reported from play, not captured yet. Press F8 right after one.
 - Saving and loading are untested (see "Status").
 - `hauntingground.ini` defaults are set up for hidden test runs (`Headless=1`, `TimeLimitSeconds=120`). If you start

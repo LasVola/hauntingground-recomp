@@ -504,6 +504,21 @@ bool texturePageHires(uint s, int u, int v)
 
 uint sampleGrid(uint s, int hu, int hv, int grid)
 {
+    // Clamp on the fine grid before splitting off the sample plane. Clamping only the native
+    // texel wraps an out-of-range tap to the opposite sub-sample of that edge texel.
+    uint size = st(s, S_TEXSIZE);
+    uint lo = st(s, S_CLAMP_LO);
+    uint hi = st(s, S_CLAMP_HI);
+    uint wrapU = lo & 3u;
+    uint wrapV = (lo >> 2u) & 3u;
+    if (wrapU == 1u)
+        hu = clamp(hu, 0, int(size & 0xFFFFu) * grid - 1);
+    else if (wrapU == 2u)
+        hu = min(max(hu, int((lo >> 4u) & 0x3FFu) * grid), (int((lo >> 14u) & 0x3FFu) + 1) * grid - 1);
+    if (wrapV == 1u)
+        hv = clamp(hv, 0, int(size >> 16u) * grid - 1);
+    else if (wrapV == 2u)
+        hv = min(max(hv, int((lo >> 24u) | ((hi & 0x3u) << 8u)) * grid), (int((hi >> 2u) & 0x3FFu) + 1) * grid - 1);
     int u = hu >= 0 ? hu / grid : -((-hu + grid - 1) / grid);
     int v = hv >= 0 ? hv / grid : -((-hv + grid - 1) / grid);
     gTexPlane = uint(hu - u * grid) + uint(hv - v * grid) * SCALE;

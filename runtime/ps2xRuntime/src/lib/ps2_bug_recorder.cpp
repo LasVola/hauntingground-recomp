@@ -61,6 +61,8 @@ namespace ps2x::bugrec
             uint32_t sourceHeight = 0u;
             uint32_t displayFbp = 0u;
             bool blank = false; // no image this field: the host showed black (thumbnail all black)
+            bool midClear = false; // composed between the game's display clear and its copy (kFrameMidClear)
+            bool repeat = false;   // nothing new this field: the last image stayed (kFrameRepeat)
             float luma = 0.0f;
             float bright = 0.0f;
             std::vector<uint8_t> rgb;
@@ -259,16 +261,16 @@ namespace ps2x::bugrec
             if (std::FILE *csv = std::fopen((dir / "frames.csv").string().c_str(), "w"))
             {
                 std::fprintf(csv, "index,field,seconds,mean_luma,bright_fraction,width,height,source_width,source_height,file,"
-                                  "display_fbp,blank\n");
+                                  "display_fbp,blank,mid_clear,repeat\n");
                 for (size_t i = 0; i < job.thumbs.size(); ++i)
                 {
                     const Thumb &t = job.thumbs[i];
                     const std::string file = "frame_" + std::to_string(t.field) + ".png";
                     if (writePng(dir / file, t.rgb.data(), t.width, t.height))
                         ++pngs;
-                    std::fprintf(csv, "%zu,%llu,%.3f,%.2f,%.4f,%u,%u,%u,%u,%s,%u,%d\n", i, static_cast<unsigned long long>(t.field),
+                    std::fprintf(csv, "%zu,%llu,%.3f,%.2f,%.4f,%u,%u,%u,%u,%s,%u,%d,%d,%d\n", i, static_cast<unsigned long long>(t.field),
                                  t.seconds, t.luma, t.bright, t.width, t.height, t.sourceWidth, t.sourceHeight, file.c_str(),
-                                 t.displayFbp, t.blank ? 1 : 0);
+                                 t.displayFbp, t.blank ? 1 : 0, t.midClear ? 1 : 0, t.repeat ? 1 : 0);
                 }
                 std::fclose(csv);
             }
@@ -327,6 +329,8 @@ namespace ps2x::bugrec
                              job.keepGsSegments ? " (automatic bundle: only the newest GS segments, ~0.5-1 s)" : "");
                 std::fprintf(info, "frames.csv display_fbp = the frame buffer shown; blank = 1: no image that field (no display "
                                    "circuit on), the screen was black\n");
+                std::fprintf(info, "frames.csv mid_clear = 1: the image was composed between the game's clear of the display buffer "
+                                   "and its copy into it (a black frame); repeat = 1: nothing new that field, the last image stayed\n");
                 std::fprintf(info, "replay: hg_replay play gs.gsr <outprefix> --fields (PS2X_GS_SCALE=3 for 2K); a frame shows field N "
                                    "about 1-2 fields after the GS drew it (async present)\n");
                 std::fclose(info);
@@ -504,13 +508,15 @@ namespace ps2x::bugrec
         t.sourceHeight = 0u;
         t.displayFbp = 0u;
         t.blank = true;
+        t.midClear = false;
+        t.repeat = false;
         t.rgb.assign(static_cast<size_t>(t.width) * t.height * 3u, 0u);
         t.luma = 0.0f;
         t.bright = 0.0f;
         commitThumb(r, t);
     }
 
-    void onPresentedFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint64_t field, uint32_t displayFbp)
+    void onPresentedFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint64_t field, uint32_t displayFbp, uint32_t flags)
     {
         if (!enabled() || !rgba || width < 2u || height < 2u)
             return;
@@ -553,6 +559,8 @@ namespace ps2x::bugrec
         t.sourceHeight = height;
         t.displayFbp = displayFbp;
         t.blank = false;
+        t.midClear = (flags & kFrameMidClear) != 0u;
+        t.repeat = (flags & kFrameRepeat) != 0u;
         t.rgb.resize(static_cast<size_t>(t.width) * t.height * 3u);
         uint64_t lumaSum = 0u;
         uint32_t brightCount = 0u;

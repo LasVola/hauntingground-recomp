@@ -35,6 +35,7 @@ file(GLOB HG_GENERATED_SOURCES CONFIGURE_DEPENDS "${HG_GENERATED_DIR}/*.cpp")
 set(HG_HOST_SOURCES
     main.cpp
     hg/button_prompts.cpp
+    hg/hiding_prompts.cpp
     hg/call_profile.cpp
     hg/call_trace.cpp
     hg/function_hooks.cpp

@@ -135,6 +135,7 @@ namespace
         uint32_t height = 0;
         uint32_t displayFbp = 0;
         uint64_t sequence = 0u;
+        uint64_t tag = 0u; // GSGpuBackend::SetPresentTag at the composite this readback holds
     };
 
     struct Program
@@ -378,6 +379,12 @@ struct GSGpuBackend::Impl
     uint64_t readbackSequence = 0u;
     uint64_t lastFrameSequence = 0u;
     PresentationFrame lastFrame;
+    // Present at the vblank (GSGpuBackend::SetLatchedPresent, gs_threaded_backend.cpp).
+    uint64_t presentTag = 0u;
+    uint64_t lastFrameTag = 0u;
+    uint64_t takenSequence = 0u;
+    bool latchedPresent = false;
+    bool lastPresentQueued = false;
     uint64_t contentRevision = 1u;
     uint64_t presentedRevision = 0u;
     std::array<uint64_t, 7> presentedCrtc{};
@@ -2953,6 +2960,7 @@ struct GSGpuBackend::Impl
         if (slot.sequence <= lastFrameSequence)
             return;
         lastFrameSequence = slot.sequence;
+        lastFrameTag = slot.tag;
         lastFrame.width = slot.width;
         lastFrame.height = slot.height;
         lastFrame.displayFbp = slot.displayFbp;
@@ -2972,7 +2980,8 @@ struct GSGpuBackend::Impl
             ++presentStats.readbackSkips;
             if (presentStats.enabled)
                 reportPresentStats();
-            return lastFrame;
+            // Latched present: no image for this composite; the present thread keeps showing the last one.
+            return latchedPresent ? PresentationFrame{} : lastFrame;
         }
         const size_t bytes = static_cast<size_t>(width) * height * 4u;
         if (slot.capacity < bytes)
@@ -3008,12 +3017,16 @@ struct GSGpuBackend::Impl
         slot.height = height;
         slot.displayFbp = displayFbp;
         slot.sequence = ++readbackSequence;
+        slot.tag = presentTag;
+        lastPresentQueued = true;
         readbackNext = (readbackNext + 1u) % static_cast<uint32_t>(readbacks.size());
         // Mode 2 (default): this present shows the previous present's readback, waiting for it if the GPU has not
         // finished it yet. Taking only what had already finished (mode 1) showed the same image again whenever the GPU
         // was a little more than one present behind and skipped one at the next: in the heaviest 4-fighter map ~40
         // distinct images per second at 60 presents (the .N.N pattern). The wait is bounded; past it the old image stays.
-        if (asyncPresentMode() == 2 && slot.sequence > 1u)
+        // Latched present (at the vblank, on the GS thread): no wait here; the GS thread picks the image up once the GPU
+        // has finished it (TakePresentedFrame) and the present thread waits for it instead.
+        if (asyncPresentMode() == 2 && slot.sequence > 1u && !latchedPresent)
         {
             for (Readback &previous : readbacks)
             {
@@ -3035,6 +3048,8 @@ struct GSGpuBackend::Impl
             presentStats.queryOpen = true;
             reportPresentStats();
         }
+        if (latchedPresent)
+            return {}; // the image comes from TakePresentedFrame (no copy of lastFrame per present)
         return lastFrame;
     }
 
@@ -3276,6 +3291,59 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
         d.localToHostTransfer();
 }
 
+void GSGpuBackend::SetPresentTag(uint64_t tag)
+{
+    m_impl->presentTag = tag;
+}
+
+void GSGpuBackend::SetLatchedPresent(bool latched)
+{
+    m_impl->latchedPresent = latched;
+}
+
+bool GSGpuBackend::PresentIsAsync() const
+{
+    return asyncPresentMode() != 0;
+}
+
+bool GSGpuBackend::LastPresentQueued() const
+{
+    return m_impl->lastPresentQueued;
+}
+
+bool GSGpuBackend::PresentPending() const
+{
+    for (const auto &slot : m_impl->readbacks)
+        if (slot.fence)
+            return true;
+    return false;
+}
+
+uint64_t GSGpuBackend::LastFrameTag() const
+{
+    return m_impl->lastFrameTag;
+}
+
+// GS thread: the readbacks the GPU has finished are harvested (no wait). True when a newer image than the one taken last
+// is there: its pixels are swapped into out (out's buffer is reused for the next harvest), tag = its SetPresentTag value.
+bool GSGpuBackend::TakePresentedFrame(PresentationFrame &out, uint64_t &tag)
+{
+    Impl &d = *m_impl;
+    for (uint32_t i = 0; i < d.readbacks.size(); ++i)
+        d.harvest(d.readbacks[(d.readbackNext + i) % d.readbacks.size()]);
+    if (d.lastFrameSequence <= d.takenSequence || !d.lastFrame)
+        return false;
+    d.takenSequence = d.lastFrameSequence;
+    out.width = d.lastFrame.width;
+    out.height = d.lastFrame.height;
+    out.displayFbp = d.lastFrame.displayFbp;
+    out.sourceFbp = d.lastFrame.sourceFbp;
+    out.usedPreferred = d.lastFrame.usedPreferred;
+    out.pixels.swap(d.lastFrame.pixels);
+    tag = d.lastFrameTag;
+    return true;
+}
+
 bool GSGpuBackend::BeginSnapshotAsync(std::function<void(std::vector<uint8_t> &&, GSBackendState &&)> done)
 {
     Impl &d = *m_impl;
@@ -3330,6 +3398,7 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
 {
     Impl &d = *m_impl;
     PresentationFrame result{};
+    d.lastPresentQueued = false;
     if (!d.ensure())
         return result;
     d.flushBatch();
@@ -3427,6 +3496,7 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
         return d.presentAsync(width, height, circuits[0].enabled ? circuits[0].fbp : circuits[1].fbp);
     result.pixels.resize(static_cast<size_t>(width) * height * 4u);
     d.readData(result.pixels.data(), result.pixels.size());
+    d.lastFrameTag = d.presentTag;
     result.displayFbp = circuits[0].enabled ? circuits[0].fbp : circuits[1].fbp;
     result.sourceFbp = result.displayFbp;
     result.usedPreferred = false;

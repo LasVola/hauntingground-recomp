@@ -684,6 +684,8 @@ namespace
 
 void ps2xHostVsyncSetWindow(void *window) noexcept; // Kernel/host_vsync.cpp
 void ps2xEeFlushDeferredCycles() noexcept; // Kernel/EeScheduler.cpp
+void ps2xGsLastPresentInfo(int &status, bool &midClear); // gs/gs_frontend.cpp: 0 new, 1 nothing new, 2 display off, 3 old path none
+void ps2xGsNotePresentConsumer();                        // gs/gs_frontend.cpp: the present thread is there (vblank latches)
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
                         bool hashImages, GSSharedPresent::Frame &diagnostic)
@@ -691,10 +693,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
-    static std::vector<uint8_t> s_scratch;
+    static uint32_t s_lastDisplayFbp = 0u;
+    static std::vector<uint8_t> s_scratch;  // the image in the texture (what is on screen)
+    static std::vector<uint8_t> s_incoming; // the next one (swapped with s_scratch once it is good)
     static uint64_t s_lastHash = 0u;
     diagnostic.contentHash = s_lastHash;
     diagnostic.hashValid = hashImages && s_lastWidth != 0u && s_lastHeight != 0u;
+    ps2xGsNotePresentConsumer();
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     if (currentTick == s_lastPresentationTick)
@@ -711,19 +716,51 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         return;
     }
 
+    int status = 3;
+    bool midClear = false;
+    ps2xGsLastPresentInfo(status, midClear);
+    // The last image stays on screen (no upload): the vblank latch had nothing newer in time (status 1), or (below) no
+    // image came although a display circuit is on. The bug recorder gets that image again, marked repeat.
+    const bool haveLast = tex.id != 0 && s_lastWidth != 0u && s_lastHeight != 0u &&
+                          s_scratch.size() >= static_cast<size_t>(s_lastWidth) * s_lastHeight * 4u;
+    const auto repeatLast = [&]
+    {
+        ps2x::bugrec::onPresentedFrame(s_scratch.data(), s_lastWidth, s_lastHeight, currentTick, s_lastDisplayFbp,
+                                       ps2x::bugrec::kFrameRepeat);
+        outWidth = s_lastWidth;
+        outHeight = s_lastHeight;
+    };
+    if (status == 1 && haveLast)
+    {
+        repeatLast();
+        return;
+    }
+
     uint32_t width = 0u;
     uint32_t height = 0u;
     uint32_t displayFbp = 0u;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch, width, height, &displayFbp) || width == 0u || height == 0u)
+    if (status == 2 || !rt->gs().copyLatchedHostPresentationFrame(s_incoming, width, height, &displayFbp) || width == 0u ||
+        height == 0u)
     {
-        // No image this field (no display circuit on, or none yet): the window shows black. The bug recorder counts it
-        // as a black frame.
+        // No image this field. Black only when the display is really off (status 2: the vblank latch found no display
+        // circuit on; old path: PMODE/DISPLAY now). Otherwise (no frame yet, none composed in time) the last image stays
+        // (hardening F3, port_prep/blackflash/ANALYSIS.md).
+        const GSRegisters &regs = rt->memory().gs();
+        const bool displayOn = ((regs.pmode & 0x1ull) != 0u && regs.display1 != 0u) || ((regs.pmode & 0x2ull) != 0u && regs.display2 != 0u);
+        if (status != 2 && displayOn && haveLast)
+        {
+            repeatLast();
+            return;
+        }
+        // The window shows black. The bug recorder counts it as a black frame.
         ps2x::bugrec::onBlankFrame(currentTick);
         diagnostic.hashValid = false;
         outWidth = s_lastWidth = 0u;
         outHeight = s_lastHeight = 0u;
         return;
     }
+    s_scratch.swap(s_incoming);
+    s_lastDisplayFbp = displayFbp;
 
     if (tex.id == 0 || static_cast<uint32_t>(tex.width) != width || static_cast<uint32_t>(tex.height) != height)
     {
@@ -736,7 +773,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
     UpdateTexture(tex, s_scratch.data());
     // Bug recorder (PS2X_BUG_RECORDER=1): a 320-px thumbnail of this frame into its RAM ring (no GPU work).
-    ps2x::bugrec::onPresentedFrame(s_scratch.data(), width, height, currentTick, displayFbp);
+    ps2x::bugrec::onPresentedFrame(s_scratch.data(), width, height, currentTick, displayFbp,
+                                   midClear ? ps2x::bugrec::kFrameMidClear : 0u);
     if (hashImages)
     {
         const auto mix = [](uint32_t value)

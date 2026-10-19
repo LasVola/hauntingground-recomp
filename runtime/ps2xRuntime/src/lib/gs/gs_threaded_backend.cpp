@@ -128,10 +128,13 @@ namespace
     }
 }
 
+void ps2xGsNoteHostShownMidClear(bool shown); // present at the vblank block below
+
 GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
     : m_inner(std::move(inner))
 {
     m_rawGif = m_inner && m_inner->WantsRawGif();
+    m_gpuInner = dynamic_cast<GSGpuBackend *>(m_inner.get());
     const char *compact = std::getenv("PS2X_GS_COMPACT_QUEUE");
     m_compactQueue = !compact || *compact != '0';
     // 64 chunks (4 MB) in flight by default instead of 8: the game thread produces draws in bursts (each VU1 job's
@@ -308,6 +311,32 @@ void GSThreadedBackend::PublishLocked()
         m_open.reserve(kPublishBytes + 4096u);
 }
 
+// Present at the vblank: the latch should reach the GS thread at once, but the EE thread must not wait at its vblank. With
+// the queue full (the GS thread 4 MB behind) the chunk stays open and goes with the next publish.
+void GSThreadedBackend::TryPublishLocked()
+{
+    if (m_open.empty())
+        return;
+    std::vector<uint8_t> next;
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        if (m_stop || m_pending.size() >= m_queueChunkLimit)
+            return;
+        m_pending.push_back(std::move(m_open));
+        ++m_published;
+        if (!m_spare.empty())
+        {
+            next = std::move(m_spare.back());
+            m_spare.pop_back();
+        }
+    }
+    m_workCv.notify_one();
+    next.clear();
+    m_open = std::move(next);
+    if (m_open.capacity() < kPublishBytes)
+        m_open.reserve(kPublishBytes + 4096u);
+}
+
 void GSThreadedBackend::Drain() const
 {
     auto *self = const_cast<GSThreadedBackend *>(this);
@@ -342,21 +371,41 @@ void GSThreadedBackend::WorkerLoop()
     for (;;)
     {
         std::vector<uint8_t> chunk;
+        bool idle = false;
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
-            m_workCv.wait(lock, [&]
-                          { return m_stop || !m_pending.empty(); });
+            // Present at the vblank: while a present readback is in flight, look for it about every 1 ms even when idle
+            // (a timed wait, not a spin; busy, it is looked for between chunks every 0.2 ms).
+            if (m_latchPolling)
+                m_workCv.wait_for(lock, std::chrono::milliseconds(1), [&]
+                                  { return m_stop || !m_pending.empty(); });
+            else
+                m_workCv.wait(lock, [&]
+                              { return m_stop || !m_pending.empty(); });
             if (m_stop)
             {
                 m_inner.reset();
                 return;
             }
-            chunk = std::move(m_pending.front());
-            m_pending.pop_front();
+            if (m_pending.empty())
+                idle = true;
+            else
+            {
+                chunk = std::move(m_pending.front());
+                m_pending.pop_front();
+            }
+        }
+        if (idle)
+        {
+            std::lock_guard<std::mutex> exec(m_execMutex);
+            PollLatched();
+            continue;
         }
         {
             std::lock_guard<std::mutex> exec(m_execMutex);
             Execute(chunk, draw);
+            if (m_latchPolling && std::chrono::steady_clock::now() - m_lastPoll >= std::chrono::microseconds(200))
+                PollLatched();
         }
         // Bug recorder: a copy of the executed chunk goes into the ring (GS thread only; the chunk itself is recycled as
         // before).
@@ -389,9 +438,14 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
             _mm_setcsr(readAt<uint32_t>(payload));
             break;
         case Op::Submit:
+        {
+            const GSPrimitiveBatch batch = readAt<GSPrimitiveBatch>(payload);
             if (!discardDraws())
-                m_inner->Submit(readAt<GSPrimitiveBatch>(payload));
+                m_inner->Submit(batch);
+            if (m_watchRect.valid && batch.state.context.frame.fbp == m_watchRect.fbp)
+                WatchDisplayDraw(batch);
             break;
+        }
         case Op::LoadClut:
         {
             const LoadClutArgs args = readAt<LoadClutArgs>(payload);
@@ -423,6 +477,8 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
             std::memcpy(&draw, payload, offsetof(GSPrimitiveBatch, state));
             if (!discardDraws())
                 m_inner->Submit(draw);
+            if (m_watchRect.valid && draw.state.context.frame.fbp == m_watchRect.fbp)
+                WatchDisplayDraw(draw);
             break;
         case Op::Present:
             m_inner->Present(readAt<GSPresentationRequest>(payload));
@@ -452,6 +508,9 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
             RingAtMark(payload, static_cast<uint32_t>(offset - 5u - length), draw);
             break;
         case Op::RingRecord:
+            break;
+        case Op::LatchPresent:
+            ExecuteLatch(payload, length);
             break;
         }
     }
@@ -1081,12 +1140,18 @@ std::string GSThreadedBackend::RingStats()
 
 void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 {
-    RunOnWorker([&] { m_inner->Initialize(vram, vramSize); });
+    RunOnWorker([&]
+                {
+        m_clearPending = false; // VRAM replaced (start-up, save state): the display-clear watch starts again
+        m_inner->Initialize(vram, vramSize); });
 }
 
 void GSThreadedBackend::Reset()
 {
-    RunOnWorker([&] { m_inner->Reset(); });
+    RunOnWorker([&]
+                {
+        m_clearPending = false;
+        m_inner->Reset(); });
 }
 
 void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
@@ -1258,8 +1323,19 @@ PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &reques
         PublishLocked();
         return {};
     }
+    // The old path (PS2X_PRESENT_AT_VBLANK=0, or before the first vblank latch): composed where the stream is now.
     PresentationFrame frame;
-    RunOnWorker([&] { frame = m_inner->Present(request); });
+    RunOnWorker([&]
+                {
+        bool blank = false;
+        const bool midClear = NoteComposite(request, "host present, old path", blank);
+        const uint64_t tag = (uint64_t{1} << 63u) | (++m_hostPresentSeq << 1u) | (midClear ? 1u : 0u);
+        if (m_gpuInner)
+            m_gpuInner->SetPresentTag(tag);
+        frame = m_inner->Present(request);
+        // The GPU's asynchronous present returns an earlier composite (its tag tells whether that one was mid-clear).
+        const uint64_t shown = (m_gpuInner && m_gpuInner->PresentIsAsync()) ? m_gpuInner->LastFrameTag() : tag;
+        ps2xGsNoteHostShownMidClear(static_cast<bool>(frame) && (shown & 1u) != 0u); });
     return frame;
 }
 
@@ -1268,6 +1344,300 @@ bool GSThreadedBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba
     bool result = false;
     RunOnWorker([&] { result = m_inner->ClearFramebuffer(context, rgba); });
     return result;
+}
+
+// ---- Present at the vblank (PS2X_PRESENT_AT_VBLANK, default on) --------------------------------------------------------
+// GS::vblank (EE thread, gs_frontend.cpp) issues a latch number and queues Op::LatchPresent with the display registers
+// of that vblank. The GS thread composes right there in stream order and publishes the image (CPU back end and
+// synchronous GPU readback: at once; asynchronous GPU readback: once the GPU has finished it, picked up by polling
+// between chunks, about every 1 ms when idle). The present thread (TakeLatched) waits up to a bounded time for the newest
+// latch and otherwise keeps the last image. Nothing here makes the EE thread wait for the GS thread or the present
+// thread, and the GS thread never waits for the present thread.
+namespace
+{
+    struct LatchArgs
+    {
+        GSPresentationRequest request;
+        uint64_t seq;
+    };
+
+    // EE thread: issued. GS thread: resolved, the image, blank. Present thread: takes. One per process (one present
+    // thread); a GS back end that is replaced takes its latches with it (the present thread then times out once and
+    // keeps its last image).
+    struct LatchMailbox
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        uint64_t issued = 0u;     // newest latch number issued
+        uint64_t resolved = 0u;   // newest latch number with a result (an image, blank, or nothing new)
+        uint64_t frameSeq = 0u;   // latch number of the image in pixels
+        uint64_t blankSeq = 0u;   // newest latch that found no display circuit on
+        uint64_t takenSeq = 0u;   // present thread: frameSeq of the image it took last
+        uint64_t seenIssued = 0u; // present thread: issued at its last take
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0u;
+        uint32_t height = 0u;
+        uint32_t displayFbp = 0u;
+        uint32_t sourceFbp = 0u;
+        bool usedPreferred = false;
+        bool midClear = false;
+    };
+
+    LatchMailbox &latchMailbox()
+    {
+        static LatchMailbox *mailbox = new LatchMailbox(); // never destroyed: the GS thread may still publish at exit
+        return *mailbox;
+    }
+
+    std::atomic<uint64_t> g_midClearComposites{0u};
+    std::atomic<uint32_t> g_midClearLogged{0u};
+    std::atomic<bool> g_hostShownMidClear{false};
+    constexpr uint32_t kMidClearLogLines = 20u;
+
+    // GS thread. frame: swapped into the mailbox (frame gets the mailbox's old buffer back for reuse).
+    void latchPublish(uint64_t seq, PresentationFrame *frame, bool midClear, bool blank)
+    {
+        LatchMailbox &mb = latchMailbox();
+        {
+            std::lock_guard<std::mutex> lock(mb.mutex);
+            if (blank)
+                mb.blankSeq = std::max(mb.blankSeq, seq);
+            else if (frame && seq > mb.frameSeq && seq > mb.blankSeq)
+            {
+                mb.pixels.swap(frame->pixels);
+                mb.width = frame->width;
+                mb.height = frame->height;
+                mb.displayFbp = frame->displayFbp;
+                mb.sourceFbp = frame->sourceFbp;
+                mb.usedPreferred = frame->usedPreferred;
+                mb.midClear = midClear;
+                mb.frameSeq = seq;
+            }
+            mb.resolved = std::max(mb.resolved, seq);
+        }
+        mb.cv.notify_all();
+    }
+}
+
+void ps2xGsNoteHostShownMidClear(bool shown)
+{
+    g_hostShownMidClear.store(shown, std::memory_order_relaxed);
+}
+
+bool GSThreadedBackend::PresentAtVblankRequested()
+{
+    static const bool on = []
+    {
+        const char *v = std::getenv("PS2X_PRESENT_AT_VBLANK");
+        return !(v && *v == '0');
+    }();
+    return on;
+}
+
+bool GSThreadedBackend::HostPresentShownMidClear()
+{
+    return g_hostShownMidClear.load(std::memory_order_relaxed);
+}
+
+uint64_t GSThreadedBackend::MidClearComposites()
+{
+    return g_midClearComposites.load(std::memory_order_relaxed);
+}
+
+bool GSThreadedBackend::DisplayRectFromRegs(uint64_t pmode, uint64_t smode2, uint64_t dispfb1, uint64_t display1,
+                                            uint64_t dispfb2, uint64_t display2, DisplayRect &out)
+{
+    // Same rules as the composite (decodeCircuit in gs_gpu_backend.cpp / gs_cpu_backend.cpp).
+    const bool halfHeight = (smode2 & 0x3ull) == 0x3ull;
+    const auto decode = [&](bool enabled, uint64_t dispfb, uint64_t display)
+    {
+        if (!enabled || display == 0u)
+            return false;
+        const int32_t hdiv = static_cast<int32_t>((display >> 23) & 0xFu) + 1;
+        const int32_t vdiv = (static_cast<int32_t>((display >> 27) & 0x3u) + 1) * (halfHeight ? 2 : 1);
+        const int32_t dw = static_cast<int32_t>((display >> 32) & 0xFFFu) + 1;
+        const int32_t dh = static_cast<int32_t>((display >> 44) & 0x7FFu) + 1;
+        if (dw < hdiv || dh < vdiv)
+            return false;
+        out.valid = true;
+        out.fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
+        out.x0 = static_cast<int32_t>((dispfb >> 32) & 0x7FFu);
+        out.y0 = static_cast<int32_t>((dispfb >> 43) & 0x7FFu);
+        out.x1 = out.x0 + dw / hdiv - 1;
+        out.y1 = out.y0 + dh / vdiv - 1;
+        return true;
+    };
+    out = {};
+    return decode((pmode & 0x1ull) != 0u, dispfb1, display1) || decode((pmode & 0x2ull) != 0u, dispfb2, display2);
+}
+
+// An untextured sprite over the whole displayed rectangle of the displayed frame buffer (colour not fully masked):
+// sceGsSetDefClear-style clears (Haunting Ground: rgba 0 into FBP 0, 640x448, every game frame).
+bool GSThreadedBackend::IsDisplayClear(const GSPrimitiveBatch &draw, const DisplayRect &rect)
+{
+    const GSDrawState &state = draw.state;
+    const GSContext &ctx = state.context;
+    if (!rect.valid || ctx.frame.fbp != rect.fbp || state.prim.tme || state.prim.type != GS_PRIM_SPRITE || draw.vertexCount < 2u)
+        return false;
+    if ((ctx.frame.fbmsk & 0x00FFFFFFu) == 0x00FFFFFFu)
+        return false;
+    const GSVertex &v0 = draw.vertices[0];
+    const GSVertex &v1 = draw.vertices[1];
+    int x0 = static_cast<int>(v0.x) - (ctx.xyoffset.ofx >> 4);
+    int y0 = static_cast<int>(v0.y) - (ctx.xyoffset.ofy >> 4);
+    int x1 = static_cast<int>(v1.x) - (ctx.xyoffset.ofx >> 4);
+    int y1 = static_cast<int>(v1.y) - (ctx.xyoffset.ofy >> 4);
+    if (x0 > x1)
+        std::swap(x0, x1);
+    if (y0 > y1)
+        std::swap(y0, y1);
+    const int xEnd = x0 + std::max(1, x1 - x0) - 1;
+    const int yEnd = y0 + std::max(1, y1 - y0) - 1;
+    return x0 <= rect.x0 && y0 <= rect.y0 && xEnd >= rect.x1 && yEnd >= rect.y1;
+}
+
+// GS thread, a draw into the displayed frame buffer: a clear sets the flag, the next textured draw (the copy) resets it.
+void GSThreadedBackend::WatchDisplayDraw(const GSPrimitiveBatch &draw)
+{
+    if (draw.state.prim.tme)
+        m_clearPending = false;
+    else if (IsDisplayClear(draw, m_watchRect))
+        m_clearPending = true;
+}
+
+// GS thread, at every composite (vblank latch or old path): the displayed buffer for the watch; true when this composite
+// sees the display buffer cleared and not yet drawn again. blank: no display circuit on.
+bool GSThreadedBackend::NoteComposite(const GSPresentationRequest &request, const char *path, bool &blank)
+{
+    DisplayRect rect;
+    blank = !DisplayRectFromRegs(request.pmode, request.smode2, request.dispfb1, request.display1, request.dispfb2,
+                                 request.display2, rect);
+    if (!rect.valid || !m_watchRect.valid || rect.fbp != m_watchRect.fbp)
+        m_clearPending = false; // another buffer shown: its state is not known
+    m_watchRect = rect;
+    if (blank || !m_clearPending)
+        return false;
+    const uint64_t count = g_midClearComposites.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    const uint32_t logged = g_midClearLogged.fetch_add(1u, std::memory_order_relaxed);
+    if (logged < kMidClearLogLines)
+    {
+        std::fprintf(stderr, "[present] composite between clear and copy: field %llu, display FBP %u (%s, #%llu)%s\n",
+                     static_cast<unsigned long long>(request.vsyncTick), rect.fbp, path, static_cast<unsigned long long>(count),
+                     logged + 1u == kMidClearLogLines ? "; further ones are only counted" : "");
+        std::fflush(stderr);
+    }
+    return true;
+}
+
+uint64_t GSThreadedBackend::LatchIssue()
+{
+    LatchMailbox &mb = latchMailbox();
+    std::lock_guard<std::mutex> lock(mb.mutex);
+    return ++mb.issued;
+}
+
+// EE thread, at the vblank (GS::vblank holds the GS state lock). Appends the latch like Enqueue does, but publishes only
+// when the queue has room, and never through PublishLocked's wait: the EE thread does not wait here.
+void GSThreadedBackend::LatchPresent(const GSPresentationRequest &request, uint64_t seq)
+{
+    const LatchArgs args{request, seq};
+    std::lock_guard<std::mutex> lock(m_producerMutex);
+    const uint32_t csr = _mm_getcsr();
+    if (csr != m_lastMxcsr)
+    {
+        m_lastMxcsr = csr;
+        const uint8_t header = static_cast<uint8_t>(Op::Mxcsr);
+        const uint32_t csrSize = sizeof(csr);
+        m_open.push_back(header);
+        m_open.insert(m_open.end(), reinterpret_cast<const uint8_t *>(&csrSize), reinterpret_cast<const uint8_t *>(&csrSize) + 4);
+        m_open.insert(m_open.end(), reinterpret_cast<const uint8_t *>(&csr), reinterpret_cast<const uint8_t *>(&csr) + 4);
+    }
+    uint8_t header[5];
+    header[0] = static_cast<uint8_t>(Op::LatchPresent);
+    const uint32_t length = sizeof(args);
+    std::memcpy(header + 1u, &length, sizeof(length));
+    m_open.insert(m_open.end(), header, header + sizeof(header));
+    m_open.insert(m_open.end(), reinterpret_cast<const uint8_t *>(&args), reinterpret_cast<const uint8_t *>(&args) + sizeof(args));
+    TryPublishLocked();
+}
+
+// GS thread: the latch, in stream order.
+void GSThreadedBackend::ExecuteLatch(const uint8_t *payload, uint32_t length)
+{
+    if (length < sizeof(LatchArgs))
+        return;
+    const LatchArgs args = readAt<LatchArgs>(payload);
+    m_latchStarted = true;
+    bool blank = false;
+    const bool midClear = NoteComposite(args.request, "vblank latch", blank);
+    m_inner->Sync(GSSyncReason::Presentation);
+    if (m_gpuInner)
+    {
+        m_gpuInner->SetLatchedPresent(true);
+        m_gpuInner->SetPresentTag((args.seq << 1u) | (midClear ? 1u : 0u));
+    }
+    PresentationFrame frame = m_inner->Present(args.request);
+    if (blank)
+        latchPublish(args.seq, nullptr, false, true);
+    else if (m_gpuInner && m_gpuInner->PresentIsAsync())
+    {
+        if (!m_gpuInner->LastPresentQueued())
+            latchPublish(args.seq, nullptr, false, false); // no free readback slot: nothing new for this latch
+    }
+    else
+        latchPublish(args.seq, frame ? &frame : nullptr, midClear, false);
+    PollLatched();
+}
+
+// GS thread: hands a finished asynchronous readback to the present thread (no wait).
+void GSThreadedBackend::PollLatched()
+{
+    m_lastPoll = std::chrono::steady_clock::now();
+    if (!m_gpuInner || !m_latchStarted)
+    {
+        m_latchPolling = false;
+        return;
+    }
+    PresentationFrame frame;
+    frame.pixels.swap(m_latchScratch);
+    uint64_t tag = 0u;
+    // Tags with the top bit come from old-path presents (before the first latch): not a latch image.
+    if (m_gpuInner->TakePresentedFrame(frame, tag) && (tag >> 63u) == 0u)
+        latchPublish(tag >> 1u, &frame, (tag & 1u) != 0u, false);
+    m_latchScratch.swap(frame.pixels);
+    m_latchPolling = m_gpuInner->PresentPending();
+}
+
+// Present thread.
+GSThreadedBackend::LatchResult GSThreadedBackend::TakeLatched(int waitUs, std::vector<uint8_t> &pixels, LatchedInfo &info)
+{
+    LatchMailbox &mb = latchMailbox();
+    const auto start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(mb.mutex);
+    const uint64_t seen = mb.seenIssued;
+    // Ready: a latch newer than at the last take was issued (this field's vblank) and the newest one has a result.
+    const auto ready = [&] { return mb.issued > seen && mb.resolved >= mb.issued; };
+    bool ok = ready();
+    if (!ok && waitUs > 0)
+        ok = mb.cv.wait_until(lock, start + std::chrono::microseconds(waitUs), ready);
+    info = {};
+    info.timedOut = !ok;
+    info.waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    mb.seenIssued = mb.issued;
+    if (mb.blankSeq > mb.frameSeq)
+        return LatchResult::Blank;
+    if (mb.frameSeq <= mb.takenSeq)
+        return LatchResult::Repeat;
+    mb.takenSeq = mb.frameSeq;
+    pixels.swap(mb.pixels);
+    info.width = mb.width;
+    info.height = mb.height;
+    info.displayFbp = mb.displayFbp;
+    info.sourceFbp = mb.sourceFbp;
+    info.usedPreferred = mb.usedPreferred;
+    info.midClear = mb.midClear;
+    info.seq = mb.frameSeq;
+    return LatchResult::NewFrame;
 }
 
 // Save state loaded: a readback being served or captured belongs to the session before it (the cache stays).

@@ -23,6 +23,7 @@
 #include "hg/function_hooks.h"
 #include "hg/game_disc.h"
 #include "hg/hang_dump.h"
+#include "hg/hiding_prompts.h"
 #include "hg/hle_bindings.h"
 #include "hg/host_window.h"
 #include "hg/log.h"
@@ -278,6 +279,7 @@ namespace
     };
     constexpr IniSetting kIniSettings[] = {
         {"game", "iso", "HG_ISO"},
+        {"game", "hidehidingprompts", "HG_HIDE_HIDING_PROMPTS"},
         {"run", "headless", "HG_HEADLESS"},
         {"run", "timelimitseconds", "HG_TIME_LIMIT_SECONDS"},
         {"run", "dumpontimelimit", "HG_DUMP_ON_TIME_LIMIT"},
@@ -725,6 +727,8 @@ int main(int argc, char *argv[])
             HG_INFO(Ee, "EE FPU host mode: round toward zero, denormals flushed");
         });
         hg::installHleBindings(runtime); // SLUS_210.75 table: hg/hg_sdk_functions.inc (port_prep/hle-bindings)
+        hg::hiding_prompts::setHidden(envFlag("HG_HIDE_HIDING_PROMPTS", false)); // [Game] HideHidingPrompts
+        hg::hiding_prompts::install(runtime); // JP-style: no "Hiding..." / "Coast Clear" notices when on
         hg::button_prompts::install(runtime); // PC keys in the PS2 button icons (port_prep/prompts/DESIGN.md); HG_PROMPTS=0 = off
 #if defined(HG_HAS_VU1_PROGRAMS) && HG_HAS_VU1_PROGRAMS
         registerGeneratedVu1Programs();

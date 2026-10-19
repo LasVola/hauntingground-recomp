@@ -2,10 +2,13 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_recording.h"
 #include "runtime/gs/gs_threaded_backend.h"
+#include "runtime/gs/gs_shared_present.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_async_vif.h"
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <vector>
 #include <mutex>
 #include <deque>
@@ -62,6 +65,128 @@ namespace
 }
 
 void ps2xGsReleaseStall();
+
+// Present at the vblank (PS2X_PRESENT_AT_VBLANK, default on; GSThreadedBackend::LatchPresent). GS::vblank (EE thread)
+// latches the display in GS stream order; latchHostPresentationFrame (present thread) takes the newest image instead of
+// composing at whatever point of the stream the game has reached. The state is file-local so gs_frontend.h (in the
+// generated-code PCH) is unchanged.
+namespace
+{
+    std::atomic<bool> g_latchMode{false};              // GS::vblank latches (EE thread sets it)
+    std::atomic<int64_t> g_presentConsumerNs{0};       // the present thread's last request (steady clock, ns)
+    constexpr int64_t kConsumerIdleNs = 250000000;     // no request for 0.25 s (minimised): no latches
+    std::vector<uint8_t> g_latchIncoming;              // present thread: buffer handed back and forth with the GS thread
+
+    // Present thread: what the last latchHostPresentationFrame gave (ps2xGsLastPresentInfo).
+    // status 0 = a new image, 1 = nothing new (the last image stays), 2 = no display circuit on (black), 3 = old path
+    // without an image (UploadFrame decides by PMODE).
+    int g_presentStatus = 3;
+    bool g_presentMidClear = false;
+
+    struct LatchStats
+    {
+        uint64_t fresh = 0u, repeats = 0u, timeouts = 0u, blanks = 0u;
+        double waitSum = 0.0, waitMax = 0.0;
+        std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+        bool announced = false;
+    };
+    LatchStats g_latchStats;
+
+    int64_t steadyNowNs()
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // PS2X_PRESENT_WAIT_US: how long the present waits for the newest latch (default 8000 = the async present's bound).
+    int presentWaitUs()
+    {
+        static const int us = []
+        {
+            const char *v = std::getenv("PS2X_PRESENT_WAIT_US");
+            return (v && *v) ? std::clamp(std::atoi(v), 0, 50000) : 8000;
+        }();
+        return us;
+    }
+
+    // A [present] line every 10 s with PS2X_PRESENT_STATS=1 or PS2X_PACING_STATS=1 (both launchers set the latter).
+    bool presentStatsEnabled()
+    {
+        static const bool on = []
+        {
+            const char *a = std::getenv("PS2X_PRESENT_STATS");
+            const char *b = std::getenv("PS2X_PACING_STATS");
+            return (a && *a == '1') || (b && *b == '1');
+        }();
+        return on;
+    }
+
+    GSThreadedBackend *findThreadedBackend(GSRasterBackend *backend)
+    {
+        for (int depth = 0; backend && depth < 4; ++depth)
+        {
+            if (auto *threaded = dynamic_cast<GSThreadedBackend *>(backend))
+                return threaded;
+            if (auto *ring = dynamic_cast<GSRingRecorderBackend *>(backend))
+                backend = ring->InnerBackend();
+            else if (auto *recording = dynamic_cast<GSRecordingBackend *>(backend))
+                backend = recording->InnerBackend();
+            else
+                return nullptr;
+        }
+        return nullptr;
+    }
+
+    // Test only, PS2X_TEST_DISPLAY_CLEAR_DELAY_US=<us> (ANALYSIS.md section 5): after a GIF packet that cleared the
+    // displayed frame buffer (an untextured sprite over the whole display), the game thread sleeps that long, with the GS
+    // state lock released, so a present taken between the clear and the copy becomes likely (the old path shows black).
+    int testClearDelayUs()
+    {
+        static const int us = []
+        {
+            const char *v = std::getenv("PS2X_TEST_DISPLAY_CLEAR_DELAY_US");
+            return (v && *v) ? std::clamp(std::atoi(v), 0, 100000) : 0;
+        }();
+        return us;
+    }
+    thread_local int t_gifDepth = 0;
+    thread_local bool t_clearDelayPending = false;
+    std::atomic<uint64_t> g_testClearDelays{0u};
+
+    struct TestClearDelayScope
+    {
+        // Declared before the packet's lock_guard: the destructor runs after the lock is released.
+        TestClearDelayScope()
+        {
+            if (testClearDelayUs() > 0)
+                ++t_gifDepth;
+        }
+        ~TestClearDelayScope()
+        {
+            const int us = testClearDelayUs();
+            if (us <= 0 || --t_gifDepth != 0 || !t_clearDelayPending)
+                return;
+            t_clearDelayPending = false;
+            if (g_testClearDelays.fetch_add(1u, std::memory_order_relaxed) == 0u)
+                std::fprintf(stderr, "[present] test: PS2X_TEST_DISPLAY_CLEAR_DELAY_US=%d: the game thread sleeps after each clear of the "
+                                     "display buffer (test only, not a fix)\n", us);
+            std::this_thread::sleep_for(std::chrono::microseconds(us));
+        }
+    };
+}
+
+// ps2_runtime.cpp UploadFrame (present thread), every run loop pass, also without a new field: the present thread is
+// there (GS::vblank latches only while it is; minimised, the run loop skips UploadFrame).
+void ps2xGsNotePresentConsumer()
+{
+    g_presentConsumerNs.store(steadyNowNs(), std::memory_order_relaxed);
+}
+
+// ps2_runtime.cpp UploadFrame (present thread): see g_presentStatus.
+void ps2xGsLastPresentInfo(int &status, bool &midClear)
+{
+    status = g_presentStatus;
+    midClear = g_presentMidClear;
+}
 
 // GIF tag continuation. The GIF keeps a tag's remaining NLOOP across DMA transfers: games build long REGLIST/PACKED
 // packets in a scratchpad double buffer and send them in chunks where only the first chunk carries the GIFtag
@@ -762,6 +887,79 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
+    g_presentConsumerNs.store(steadyNowNs(), std::memory_order_relaxed);
+    if (g_latchMode.load(std::memory_order_acquire) && GSThreadedBackend::PresentAtVblankRequested() && !GSSharedPresent::Active())
+    {
+        // Present at the vblank: the newest image the GS thread composed at a vblank, in stream order. No GS state lock,
+        // no wait for the GS thread beyond the bounded wait for that image.
+        LatchStats &stats = g_latchStats;
+        if (!stats.announced)
+        {
+            stats.announced = true;
+            std::fprintf(stderr, "[present] at the vblank (PS2X_PRESENT_AT_VBLANK, =0 = old path): the display is composed in GS "
+                                 "stream order at each vblank; the present waits up to %.1f ms for it, else the last image stays\n",
+                         presentWaitUs() / 1000.0);
+        }
+        GSThreadedBackend::LatchedInfo info;
+        const GSThreadedBackend::LatchResult result = GSThreadedBackend::TakeLatched(presentWaitUs(), g_latchIncoming, info);
+        g_presentMidClear = false;
+        if (result == GSThreadedBackend::LatchResult::NewFrame)
+        {
+            {
+                std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+                m_hostPresentationFrame.swap(g_latchIncoming);
+                m_hostPresentationWidth = info.width;
+                m_hostPresentationHeight = info.height;
+                m_hostPresentationDisplayFbp = info.displayFbp;
+                m_hostPresentationSourceFbp = info.sourceFbp;
+                m_hostPresentationUsedPreferred = info.usedPreferred;
+                m_hasHostPresentationFrame = info.width != 0u && info.height != 0u;
+            }
+            g_presentStatus = 0;
+            g_presentMidClear = info.midClear;
+            ++stats.fresh;
+            // Debug history (F12): only when the game thread does not hold the GS state right now (never wait for it).
+            std::unique_lock<std::recursive_mutex> lock(m_stateMutex, std::try_to_lock);
+            if (lock.owns_lock())
+                recordPresentDebugEventUnlocked(info.displayFbp, info.sourceFbp, info.width, info.height, info.usedPreferred);
+        }
+        else if (result == GSThreadedBackend::LatchResult::Blank)
+        {
+            {
+                std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+                m_hasHostPresentationFrame = false;
+            }
+            g_presentStatus = 2;
+            ++stats.blanks;
+        }
+        else
+        {
+            g_presentStatus = 1;
+            ++stats.repeats;
+        }
+        if (info.timedOut)
+            ++stats.timeouts;
+        stats.waitSum += info.waitedMs;
+        stats.waitMax = std::max(stats.waitMax, info.waitedMs);
+        const auto now = std::chrono::steady_clock::now();
+        const double window = std::chrono::duration<double>(now - stats.windowStart).count();
+        if (window >= 10.0)
+        {
+            const uint64_t takes = stats.fresh + stats.repeats + stats.blanks;
+            if (presentStatsEnabled())
+                std::fprintf(stderr, "[present] at vblank: %.1f new images/s, %llu repeated (%llu waited out), %llu blank, wait avg %.2f ms "
+                                     "max %.2f ms; composites between clear and copy so far %llu\n",
+                             stats.fresh / window, static_cast<unsigned long long>(stats.repeats),
+                             static_cast<unsigned long long>(stats.timeouts), static_cast<unsigned long long>(stats.blanks),
+                             takes ? stats.waitSum / takes : 0.0, stats.waitMax,
+                             static_cast<unsigned long long>(GSThreadedBackend::MidClearComposites()));
+            stats.fresh = stats.repeats = stats.timeouts = stats.blanks = 0u;
+            stats.waitSum = stats.waitMax = 0.0;
+            stats.windowStart = now;
+        }
+        return;
+    }
+
     GSPresentationRequest request{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -771,6 +969,8 @@ void GS::latchHostPresentationFrame()
             m_hostPresentationFrame.clear();
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
+            g_presentStatus = 3;
+            g_presentMidClear = false;
             return;
         }
         request = buildPresentationRequestUnlocked();
@@ -788,6 +988,28 @@ void GS::latchHostPresentationFrame()
     }
 
     const bool hasFrame = static_cast<bool>(frame);
+    g_presentStatus = hasFrame ? 0 : 3;
+    g_presentMidClear = hasFrame && GSThreadedBackend::HostPresentShownMidClear();
+    {
+        static bool announced = false;
+        if (!announced && !GSThreadedBackend::PresentAtVblankRequested())
+        {
+            announced = true;
+            std::fprintf(stderr, "[present] old path (PS2X_PRESENT_AT_VBLANK=0): composed where the GS stream is when the present asks\n");
+        }
+        LatchStats &stats = g_latchStats;
+        stats.fresh += hasFrame ? 1u : 0u;
+        const auto now = std::chrono::steady_clock::now();
+        const double window = std::chrono::duration<double>(now - stats.windowStart).count();
+        if (window >= 10.0)
+        {
+            if (presentStatsEnabled())
+                std::fprintf(stderr, "[present] old path: %.1f images/s; composites between clear and copy so far %llu\n", stats.fresh / window,
+                             static_cast<unsigned long long>(GSThreadedBackend::MidClearComposites()));
+            stats.fresh = 0u;
+            stats.windowStart = now;
+        }
+    }
     const uint32_t displayFbp = frame.displayFbp;
     const uint32_t sourceFbp = frame.sourceFbp;
     const uint32_t width = frame.width;
@@ -862,6 +1084,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    TestClearDelayScope testClearDelay; // test only (PS2X_TEST_DISPLAY_CLEAR_DELAY_US); before the lock on purpose
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
@@ -1081,6 +1304,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    TestClearDelayScope testClearDelay; // test only (PS2X_TEST_DISPLAY_CLEAR_DELAY_US); before the lock on purpose
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
@@ -1452,8 +1676,35 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::vblank()
 {
-    if (!m_rawGif || !m_backend || !m_privRegs)
+    if (!m_backend || !m_privRegs)
         return;
+    if (!m_rawGif)
+    {
+        // Present at the vblank: the display as of this point of the GS stream (everything the game sent before the
+        // vblank, nothing after it) is composed on the GS thread; the present thread shows the newest such image.
+        if (!GSThreadedBackend::PresentAtVblankRequested())
+            return;
+        // No present thread for 0.25 s (window minimised, run loop not started): no latches, no GPU work for images
+        // nobody shows. Its next pass starts them again (that present keeps its last image once).
+        if (steadyNowNs() - g_presentConsumerNs.load(std::memory_order_relaxed) > kConsumerIdleNs)
+            return;
+        if (GSSharedPresent::Active())
+        {
+            g_latchMode.store(false, std::memory_order_release); // the shared-texture present has its own path
+            return;
+        }
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        GSThreadedBackend *threaded = m_rawGif ? nullptr : findThreadedBackend(m_backend.get());
+        if (!threaded)
+        {
+            g_latchMode.store(false, std::memory_order_release); // no GS thread: the old path composes on the present thread
+            return;
+        }
+        const GSPresentationRequest request = buildPresentationRequestUnlocked();
+        threaded->LatchPresent(request, GSThreadedBackend::LatchIssue());
+        g_latchMode.store(true, std::memory_order_release);
+        return;
+    }
     const GSRegisters &p = *m_privRegs;
     GSVSyncRegs regs;
     const uint64_t regset1[15] = {p.pmode, p.smode1, p.smode2, p.srfsh, p.synch1, p.synch2, p.syncv, p.dispfb1,
@@ -2005,6 +2256,14 @@ void GS::vertexKick(bool drawing)
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
+        if (testClearDelayUs() > 0 && m_privRegs)
+        {
+            GSThreadedBackend::DisplayRect rect;
+            if (GSThreadedBackend::DisplayRectFromRegs(m_privRegs->pmode, m_privRegs->smode2, m_privRegs->dispfb1, m_privRegs->display1,
+                                                       m_privRegs->dispfb2, m_privRegs->display2, rect) &&
+                GSThreadedBackend::IsDisplayClear(batch, rect))
+                t_clearDelayPending = true;
+        }
         if (gsTrace().file && gsTrace().lastTick == UINT64_MAX)
         {
             m_backend->Flush();

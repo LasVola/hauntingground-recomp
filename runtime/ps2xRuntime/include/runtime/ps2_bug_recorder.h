@@ -18,9 +18,13 @@ namespace ps2x::bugrec
     bool enabled();
     // Run loop start (main thread): one start-up line.
     void start();
+    // onPresentedFrame flags (frames.csv mid_clear / repeat columns).
+    constexpr uint32_t kFrameMidClear = 1u; // composed between the game's clear of the display buffer and its copy into it
+    constexpr uint32_t kFrameRepeat = 2u;   // nothing new this field: the last image stayed on screen
     // Main thread, once per new field: the RGBA frame (width x height) the host is about to show for that field.
     // displayFbp: the frame buffer it came from (frames.csv only).
-    void onPresentedFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint64_t field, uint32_t displayFbp = 0u);
+    void onPresentedFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint64_t field, uint32_t displayFbp = 0u,
+                          uint32_t flags = 0u);
     // Main thread, once per new field without an image (no display circuit on, no frame yet): the host shows black.
     void onBlankFrame(uint64_t field);
     // Main thread. reason: "F8", "test hook", ... note: an extra line for info.txt. marked: fields framed in red on the

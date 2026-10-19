@@ -86,6 +86,7 @@ public:
 
     static std::unique_ptr<GSRasterBackend> WrapFromEnvironment(std::unique_ptr<GSRasterBackend> inner,
                                                                 const GSRegisters *regs);
+    GSRasterBackend *InnerBackend() const { return m_inner.get(); } // present at the vblank (gs_frontend.cpp)
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -174,6 +175,7 @@ public:
     // back end).
     static std::unique_ptr<GSRasterBackend> WrapFromEnvironment(std::unique_ptr<GSRasterBackend> inner,
                                                                 const GSRegisters *regs);
+    GSRasterBackend *InnerBackend() const { return m_inner.get(); } // present at the vblank (gs_frontend.cpp)
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;

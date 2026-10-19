@@ -70,6 +70,19 @@ public:
     // this or of Present, once the copy has finished. False when no slot is free or the back end is not up.
     bool BeginSnapshotAsync(std::function<void(std::vector<uint8_t> &&, GSBackendState &&)> done);
 
+    // Present at the vblank (gs_threaded_backend.cpp, PS2X_PRESENT_AT_VBLANK). GS thread only.
+    // SetPresentTag: a number that travels with the next composite (its readback) and comes back with that image
+    // (LastFrameTag / TakePresentedFrame). SetLatchedPresent(true): the asynchronous present neither waits for the previous
+    // readback (mode 2) nor copies the newest image into Present's result; the GS thread picks finished images up with
+    // TakePresentedFrame instead (no wait; true when there is a newer one, its pixels swapped into out).
+    void SetPresentTag(uint64_t tag);
+    void SetLatchedPresent(bool latched);
+    bool PresentIsAsync() const;
+    bool LastPresentQueued() const; // the last Present queued a readback (false: no free slot, nothing shown, not up)
+    bool PresentPending() const;    // a present readback is still in flight
+    uint64_t LastFrameTag() const;  // tag of the image Present returned / TakePresentedFrame gave last
+    bool TakePresentedFrame(PresentationFrame &out, uint64_t &tag);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
