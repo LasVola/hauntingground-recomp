@@ -639,6 +639,14 @@ int main(int argc, char *argv[])
     // slices, which the user heard as sounds "playing twice"; a rare stall gives a short dropout instead.
     // PS2X_AUDIO_STRETCH=1 turns it back on. User preference; untested on Haunting Ground.
     setDefaultEnv("PS2X_AUDIO_STRETCH", "0");
+    // EE time charged per backward branch of generated code: 16 cycles (Haunting Ground only; runtime default 32, God Hand
+    // keeps 32; Urban Reign shipped 16). Emulated EE time advances only by these charges. At 32 the Sofdec movie loop
+    // charged ~3.2 fields for every MPEG I-frame (once per GOP, ~0.5 s) although the game paces it to 2: the movie ran at
+    // 29.42 instead of 29.97 frames/s, the demuxer (paced by the pictures) fell behind the 48 kHz audio, the ADX input
+    // ran dry for 100-130 ms per GOP and CRI's IOP mixer filled 256-sample units with exact zeros ("cutscene audio cuts
+    // out"; opening movie: 60 zero bursts in 115 s). At 16: 29.97 frames/s, 0 bursts (port_prep/WORKLOG.md "2026-10-19
+    // round AV (runtime)"). PS2X_EE_LOOP_CYCLES=32 = the old timing.
+    setDefaultEnv("PS2X_EE_LOOP_CYCLES", "16");
 #if defined(HG_HAS_VU1_CONTENT_PROGRAMS) && HG_HAS_VU1_CONTENT_PROGRAMS
     // VU1 content-keyed AOT on by default (Haunting Ground only; the runtime's default is off, God Hand never sets it):
     // HG uploads its 19 VU1 programs at VU address 0 over stale tails, so whole-image keys keep missing (the 12:44 play's

@@ -14,6 +14,7 @@
 #include <dbghelp.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -269,17 +270,31 @@ namespace hg::calltrace
             g_watches.push_back(watch);
         }
 
+        // HG_CALL_TRACE_A0WORDS=<n> (1-8, round AV audio diagnostic): each traced call also prints the n words at a0 and
+        // the EE cycle (eec=, same clock as the [ee-sifdma] eecycle) so calls line up with SIF transfers.
+        static const uint32_t a0Words = []
+        {
+            const char *v = std::getenv("HG_CALL_TRACE_A0WORDS");
+            return v ? static_cast<uint32_t>(std::min(8l, std::max(0l, std::atol(v)))) : 0u;
+        }();
         for (const std::string &item : splitList(std::getenv("HG_CALL_TRACE")))
         {
             const uint32_t address = static_cast<uint32_t>(std::stoul(item, nullptr, 16));
             std::ostringstream name;
             name << "trace_0x" << std::hex << address;
-            FunctionHooks::instance().observeEntry(address, name.str(), [address](uint8_t *rdram, R5900Context *ctx, PS2Runtime *) {
+            FunctionHooks::instance().observeEntry(address, name.str(), [address](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
                 std::ostringstream line;
                 line << std::hex << "call 0x" << address << " a0=0x" << getRegU32(ctx, 4) << " a1=0x" << getRegU32(ctx, 5)
                      << " a2=0x" << getRegU32(ctx, 6) << " a3=0x" << getRegU32(ctx, 7) << " ra=0x" << getRegU32(ctx, 31)
                      << " s0-s3=0x" << getRegU32(ctx, 16) << ",0x" << getRegU32(ctx, 17) << ",0x" << getRegU32(ctx, 18) << ",0x"
                      << getRegU32(ctx, 19) << " sp=0x" << getRegU32(ctx, 29);
+                if (a0Words != 0u)
+                {
+                    line << " *a0=";
+                    for (uint32_t i = 0; i < a0Words; ++i)
+                        line << (i ? "," : "") << "0x" << readWord(rdram, getRegU32(ctx, 4) + i * 4u);
+                    line << std::dec << " eec=" << (runtime ? runtime->eeScheduler().currentCycle() : 0u) << std::hex;
+                }
                 for (const Watch &watch : g_watches)
                 {
                     const uint32_t target = watch.deref ? readWord(rdram, watch.address) + watch.offset : watch.address;
